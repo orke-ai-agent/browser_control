@@ -1,0 +1,12 @@
+{
+  "name": "playwright-atlas",
+  "main": "src/atlas/index.js",
+  "scripts": {
+    "build:web": "node -e \"require('fs').accessSync('atlas_ui/build/web/index.html')\"",
+    "demo:youtube": "node chatgpt-reply.js",
+    "start": "node scripts/start-local.js"
+  },
+  "dependencies": {
+    "playwright": "^1.58.2"
+  }
+}

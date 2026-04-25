@@ -1,0 +1,35 @@
+.env
+.env.*
+!.env.example
+logs/
+runtime/
+node_modules/
+*.log
+*.jsonl
+.DS_Store
+
+# macOS / editor noise
+.idea/
+.vscode/
+
+# Flutter / Dart local artifacts
+atlas_ui/.dart_tool/
+atlas_ui/build/
+atlas_ui/.flutter-plugins
+atlas_ui/.flutter-plugins-dependencies
+atlas_ui/.packages
+atlas_ui/.flutter-plugins
+atlas_ui/.flutter-plugins-dependencies
+atlas_ui/.pub-cache/
+
+# Test and export artifacts
+test2/logs/
+test2/tmp/
+test2/out/
+
+# Generated media and browser state
+runtime/media/
+runtime/threads/
+runtime/browser-profile/
+runtime/ticket-files/
+runtime/*.json
