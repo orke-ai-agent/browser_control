@@ -18,6 +18,14 @@ If a choice requires understanding words such as "chat", "message", "search",
 "upload", "post", "send", "composer", or their translations, that choice belongs
 in the model layer unless it is a purely mechanical browser/API constraint.
 
+## Browser Session Rule
+
+An open browser window is the live work surface, not a process to wait on until it
+exits. Do not repeatedly close, reopen, or restart the browser to check progress.
+If code changes need to be applied, restart only the backend/server when needed
+and keep the existing browser session intact unless the user explicitly asks for
+a browser restart.
+
 ## Hard Ban
 
 Do not add new agent decision logic based on:

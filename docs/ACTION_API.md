@@ -80,6 +80,14 @@ Create a brand new thread with a prompt, media, or both.
 
 Append a prompt, media, or both to an existing thread.
 
+### `POST /api/tickets/:id/run`
+
+Start a saved ticket immediately, independent of its schedule.
+
+The response returns the updated ticket plus the created thread. The thread keeps
+running asynchronously, so clients should poll `GET /api/threads/:id` for status,
+messages, cycle count, and token counters.
+
 ### `GET /api/threads/:id`
 
 Return full thread state including messages, block steps, and message metadata.

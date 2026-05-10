@@ -77,7 +77,10 @@ function resolveThreadMediaSelection(mediaAttachments, mediaRef) {
   if (normalizedRef === "all_videos") return items.filter((item) => item.kind === "video");
   if (normalizedRef.startsWith("media:")) {
     const mediaId = normalizedRef.slice("media:".length);
-    const match = items.find((item) => item.id === mediaId);
+    const match = items.find((item) =>
+      String(item.id || "").trim().toLowerCase() === mediaId ||
+      String(item.fileName || "").trim().toLowerCase() === mediaId
+    );
     return match ? [match] : [];
   }
 

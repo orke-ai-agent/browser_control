@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Atlas Tickets</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <aside class="ticket-sidebar" aria-label="Ticket list">
+        <button class="primary-action" id="createTicketButton" type="button">
+          <span aria-hidden="true">+</span>
+          <span>Create Ticket</span>
+        </button>
+        <div class="sidebar-list" id="ticketList"></div>
+      </aside>
+
+      <section class="stage-panel" id="stageRoot" aria-label="Main workspace"></section>
+
+      <aside class="reserved-panel" id="fileBoxRoot" aria-label="Ticket files"></aside>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

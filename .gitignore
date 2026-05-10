@@ -14,7 +14,9 @@ node_modules/
 
 # Flutter / Dart local artifacts
 atlas_ui/.dart_tool/
-atlas_ui/build/
+atlas_ui/build/*
+!atlas_ui/build/web/
+!atlas_ui/build/web/**
 atlas_ui/.flutter-plugins
 atlas_ui/.flutter-plugins-dependencies
 atlas_ui/.packages

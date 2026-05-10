@@ -253,8 +253,37 @@ function loadTickets() {
 
 function saveTickets(tickets) {
   ensureDirectory(path.dirname(TICKETS_PATH));
+  const existingById = new Map(loadTickets().map((ticket) => [ticket.id, ticket]));
+  const now = new Date();
   const normalized = (Array.isArray(tickets) ? tickets : [])
-    .map(normalizeTicket)
+    .map((ticket) => {
+      const normalizedTicket = normalizeTicket(ticket);
+      if (!normalizedTicket) {
+        return null;
+      }
+
+      const existing = existingById.get(normalizedTicket.id);
+      const scheduleChanged = existing
+        ? existing.frequency !== normalizedTicket.frequency || existing.time !== normalizedTicket.time
+        : true;
+      const mergedTicket = {
+        ...normalizedTicket,
+        lastRunKey: normalizedTicket.lastRunKey || existing?.lastRunKey || "",
+        lastRunAt: normalizedTicket.lastRunAt || existing?.lastRunAt || "",
+        lastRunStatus: normalizedTicket.lastRunStatus || existing?.lastRunStatus || "",
+        lastThreadId: normalizedTicket.lastThreadId || existing?.lastThreadId || "",
+      };
+
+      if (scheduleChanged && isTicketDue(mergedTicket, now)) {
+        return {
+          ...mergedTicket,
+          lastRunKey: runKeyForTicket(mergedTicket, now),
+          lastRunStatus: "scheduled_skipped",
+        };
+      }
+
+      return mergedTicket;
+    })
     .filter(Boolean);
   fs.writeFileSync(TICKETS_PATH, JSON.stringify(normalized, null, 2), "utf8");
   logger.event("tickets.store", "saved", {
@@ -312,6 +341,14 @@ function listTicketFiles(ticketId) {
       };
     })
     .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function ticketFilesAsMedia(ticketId) {
+  return listTicketFiles(ticketId).map((file) => ({
+    fileName: file.name,
+    mimeType: file.mimeType,
+    buffer: fs.readFileSync(file.path),
+  }));
 }
 
 async function uploadTicketFiles(request, ticketId) {
@@ -447,6 +484,7 @@ async function runScheduledTicket(ticket, runKey) {
   try {
     const result = await actionController.submit({
       prompt: buildTicketPrompt(ticket),
+      media: ticketFilesAsMedia(ticket.id),
       forceNewThread: true,
       source: "ticket_scheduler",
     });
@@ -477,6 +515,52 @@ async function runScheduledTicket(ticket, runKey) {
   } finally {
     runningScheduledTickets.delete(ticket.id);
   }
+}
+
+async function runTicketNow(ticketId) {
+  const tickets = loadTickets();
+  const index = tickets.findIndex((item) => item.id === ticketId);
+
+  if (index === -1) {
+    return null;
+  }
+
+  const ticket = tickets[index];
+  const now = new Date();
+  const scheduledRunKey = runKeyForTicket(ticket, now);
+  const runKey = isTicketDue(ticket, now) ? scheduledRunKey : `manual-${now.toISOString()}`;
+  logger.event("tickets.manual", "ticket_run_requested", {
+    ticketId: ticket.id,
+    title: ticket.title,
+    runKey,
+  });
+
+  const result = await actionController.submit({
+    prompt: buildTicketPrompt(ticket),
+    media: ticketFilesAsMedia(ticket.id),
+    forceNewThread: true,
+    source: "ticket_manual",
+  });
+
+  tickets[index] = {
+    ...tickets[index],
+    lastRunKey: runKey,
+    lastRunAt: new Date().toISOString(),
+    lastRunStatus: "submitted",
+    lastThreadId: result.thread?.id || "",
+  };
+  const savedTickets = saveTickets(tickets);
+
+  logger.event("tickets.manual", "ticket_submitted", {
+    ticketId: ticket.id,
+    threadId: result.thread?.id || "",
+    runKey,
+  });
+
+  return {
+    ticket: savedTickets[index],
+    thread: result.thread,
+  };
 }
 
 function checkScheduledTickets() {
@@ -756,6 +840,20 @@ async function handleApi(request, response, parsedUrl) {
     sendJson(response, 200, {
       tickets,
     });
+    return true;
+  }
+
+  if (request.method === "POST" && parsedUrl.pathname.startsWith("/api/tickets/") && parsedUrl.pathname.endsWith("/run")) {
+    const parts = parsedUrl.pathname.split("/").filter(Boolean);
+    const ticketId = parts[2];
+    const result = await runTicketNow(ticketId);
+
+    if (!result) {
+      sendJson(response, 404, { error: "Ticket not found." });
+      return true;
+    }
+
+    sendJson(response, 202, result);
     return true;
   }
 
