@@ -146,19 +146,6 @@ curl -X POST http://127.0.0.1:2112/api/actions \
   -F 'media=@/absolute/path/to/poster.png'
 ```
 
-## Telegram integration
-
-Telegram uses the same action controller internally.
-
-Current behavior:
-
-- text messages become action prompts
-- photo, video, and document attachments are ingested as thread media
-- caption text is treated as the prompt when present
-- `🆕 New Thread` and `/new` reset the active thread for the next message
-- assistant block updates include emoji-based step summaries
-- when a block actually uses media, the bot can send media previews back into chat
-
 ## Planner abstraction
 
 Attached media is exposed to the planner as abstract refs:

@@ -9,7 +9,6 @@ const { createActionController } = require("./src/agent/action-controller");
 const { loadEnv } = require("./src/agent/env");
 const { createShortcutMemory } = require("./src/agent/shortcut-memory");
 const { createMediaStore } = require("./src/media/store");
-const { createTelegramBot } = require("./src/telegram/bot");
 
 function createNoopOrchestratorSocketClient() {
   return {
@@ -94,17 +93,6 @@ const actionController = createActionController({
   loadSettings,
   mediaStore,
 });
-const telegramBot =
-  env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN
-    ? createTelegramBot({
-        token: env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN,
-        logger,
-        store,
-        actionController,
-        mediaStore,
-        env,
-      })
-    : null;
 const orchestratorSocket = createOrchestratorSocketClient({
   logger,
   agentType: "browser_agent",
@@ -1041,15 +1029,6 @@ server.listen(PORT, HOST, () => {
     });
   });
 
-  if (telegramBot) {
-    telegramBot.start().catch((error) => {
-      logger.error("telegram.bot", "startup_failed", error, {
-        port: PORT,
-        host: HOST,
-      });
-    });
-  }
-
   ticketSchedulerInterval = startTicketScheduler();
 });
 
@@ -1059,7 +1038,6 @@ function shutdown() {
     ticketSchedulerInterval = null;
   }
   orchestratorSocket.shutdown();
-  telegramBot?.stop();
 }
 
 process.on("SIGINT", shutdown);

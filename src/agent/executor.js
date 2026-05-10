@@ -2,286 +2,25 @@ function compact(value) {
   return String(value || "").trim().toLowerCase();
 }
 
-function scoreSearchInput(element, hint) {
-  const haystack = [
-    element.text,
-    element.label,
-    element.placeholder,
-    element.type,
-    element.role,
-  ]
-    .map(compact)
-    .join(" ");
-
-  let score = 0;
-
-  if (element.tag === "input" || element.tag === "textarea") {
-    score += 5;
-  }
-
-  if (haystack.includes("search") || haystack.includes("искать") || haystack.includes("поиск")) {
-    score += 8;
-  }
-
-  if (haystack.includes("find")) {
-    score += 3;
-  }
-
-  if (hint && haystack.includes(compact(hint))) {
-    score += 12;
-  }
-
-  return score;
+function targetRequired(actionType, message, details = {}) {
+  const error = new Error(message);
+  error.code = "TARGET_REQUIRED";
+  error.actionType = actionType;
+  error.details = details;
+  return error;
 }
 
-function scoreGenericInput(element, hint, text) {
-  const haystack = [
-    element.text,
-    element.label,
-    element.placeholder,
-    element.type,
-    element.role,
-    element.purpose,
-    element.section,
-    element.className,
-    element.ancestorClasses,
-    element.nearbyText,
-    element.descriptor,
-  ]
-    .map(compact)
-    .join(" ");
-
-  const normalizedHint = compact(hint);
-  const normalizedText = compact(text);
-  let score = 0;
-
-  if (element.disabled) {
-    return -1000;
-  }
-
-  if (element.tag === "textarea") {
-    score += 9;
-  } else if (element.tag === "input") {
-    score += 7;
-  } else if (element.role === "textbox") {
-    score += 6;
-  }
-
-  if (element.focused) {
-    score += 4;
-  }
-
-  if (element.section === "main") {
-    score += 5;
-  }
-
-  if (element.section === "composer") {
-    score += 18;
-  }
-
-  if (element.section === "dialog") {
-    score -= 2;
-  }
-
-  if (element.section === "sidebar" || element.section === "navigation") {
-    score -= 14;
-  }
-
-  if (element.purpose === "chat_input") {
-    score += 18;
-  }
-
-  if (element.purpose === "text_input") {
-    score += 8;
-  }
-
-  if (element.purpose === "search_input") {
-    score -= 8;
-  }
-
-  if (haystack.includes("input-message") || haystack.includes("new-message-wrapper")) {
-    score += 28;
-  }
-
-  if (haystack.includes("input-search") || haystack.includes("sidebar-header")) {
-    score -= 24;
-  }
-
-  if (normalizedHint.includes("search") || normalizedHint.includes("поиск")) {
-    if (element.purpose === "search_input") {
-      score += 16;
-    }
-  }
-
-  if (
-    normalizedHint.includes("chat") ||
-    normalizedHint.includes("message") ||
-    normalizedHint.includes("composer") ||
-    normalizedHint.includes("prompt") ||
-    normalizedHint.includes("сообщ") ||
-    normalizedHint.includes("чат")
-  ) {
-    if (element.purpose === "chat_input") {
-      score += 24;
-    }
-    if (element.purpose === "search_input") {
-      score -= 18;
-    }
-  }
-
-  if (normalizedHint && haystack.includes(normalizedHint)) {
-    score += 14;
-  }
-
-  if (
-    normalizedText &&
-    (normalizedText.includes("how are you") ||
-      normalizedText.includes("как дела") ||
-      normalizedText.includes("hello") ||
-      normalizedText.includes("привет"))
-  ) {
-    if (element.purpose === "chat_input") {
-      score += 10;
-    }
-  }
-
-  return score;
+function targetNotFound(actionType, elementId, details = {}) {
+  const error = new Error(`Target element "${elementId}" was not found in the latest observation.`);
+  error.code = "TARGET_NOT_FOUND";
+  error.actionType = actionType;
+  error.elementId = elementId;
+  error.details = details;
+  return error;
 }
 
-function scoreTextCandidate(element, text) {
-  const haystack = [element.text, element.label, element.href].map(compact).join(" ");
-  const needle = compact(text);
-  let score = 0;
-
-  if (haystack === needle) {
-    score += 30;
-  }
-
-  if (haystack.includes(needle)) {
-    score += 18;
-  }
-
-  if (compact(element.text).startsWith(needle)) {
-    score += 8;
-  }
-
-  return score;
-}
-
-function scoreUploadCandidate(element, hint, mediaKind) {
-  const haystack = [
-    element.text,
-    element.label,
-    element.placeholder,
-    element.type,
-    element.role,
-    element.purpose,
-    element.section,
-    element.className,
-    element.ancestorClasses,
-    element.nearbyText,
-    element.descriptor,
-    element.accept,
-  ]
-    .map(compact)
-    .join(" ");
-  const normalizedHint = compact(hint);
-  const kind = compact(mediaKind);
-  let score = 0;
-
-  if (element.disabled) {
-    return -1000;
-  }
-
-  if (element.type === "file") {
-    score += 60;
-  }
-
-  if (element.purpose === "file_input") {
-    score += 40;
-  }
-
-  if (element.purpose === "upload_trigger") {
-    score += 28;
-  }
-
-  if (element.section === "main" || element.section === "composer") {
-    score += 12;
-  }
-
-  if (element.section === "sidebar" || element.section === "navigation") {
-    score -= 14;
-  }
-
-  if (
-    haystack.includes("upload") ||
-    haystack.includes("attach") ||
-    haystack.includes("photo") ||
-    haystack.includes("video") ||
-    haystack.includes("media") ||
-    haystack.includes("image") ||
-    haystack.includes("file")
-  ) {
-    score += 24;
-  }
-
-  if (normalizedHint && haystack.includes(normalizedHint)) {
-    score += 18;
-  }
-
-  if (kind === "video" && (haystack.includes("video") || haystack.includes("reel"))) {
-    score += 14;
-  }
-
-  if (kind === "image" && (haystack.includes("image") || haystack.includes("photo"))) {
-    score += 14;
-  }
-
-  return score;
-}
-
-function findSearchElement(observation, hint) {
-  const candidates = observation.interactive
-    .map((element) => ({
-      element,
-      score: scoreSearchInput(element, hint),
-    }))
-    .sort((left, right) => right.score - left.score);
-
-  return candidates.length && candidates[0].score > 0 ? candidates[0].element : null;
-}
-
-function findTextElement(observation, text) {
-  const candidates = observation.interactive
-    .map((element) => ({
-      element,
-      score: scoreTextCandidate(element, text),
-    }))
-    .sort((left, right) => right.score - left.score);
-
-  return candidates.length && candidates[0].score > 0 ? candidates[0].element : null;
-}
-
-function findInsertElement(observation, hint, text) {
-  const candidates = observation.interactive
-    .map((element) => ({
-      element,
-      score: scoreGenericInput(element, hint, text),
-    }))
-    .sort((left, right) => right.score - left.score);
-
-  return candidates.length && candidates[0].score > 0 ? candidates[0].element : null;
-}
-
-function findUploadElement(observation, hint, mediaKind) {
-  const candidates = observation.interactive
-    .map((element) => ({
-      element,
-      score: scoreUploadCandidate(element, hint, mediaKind),
-    }))
-    .sort((left, right) => right.score - left.score);
-
-  return candidates.length && candidates[0].score > 0 ? candidates[0].element : null;
+function actionElementId(action) {
+  return String(action?.elementId || "").trim();
 }
 
 function searchUrlFor(engine, query) {
@@ -317,21 +56,7 @@ function mediaKindToAcceptHints(mediaKind) {
   return [];
 }
 
-function scoreDomUploadCandidate(candidate, hint, mediaKind, triggerAtlasId) {
-  const haystack = [
-    candidate.tag,
-    candidate.type,
-    candidate.accept,
-    candidate.label,
-    candidate.text,
-    candidate.className,
-    candidate.nearbyText,
-    candidate.containerSummary,
-    candidate.reasons.join(" "),
-  ]
-    .map(compact)
-    .join(" ");
-  const normalizedHint = compact(hint);
+function scoreDomUploadCandidate(candidate, mediaKind, triggerAtlasId) {
   const acceptHints = mediaKindToAcceptHints(mediaKind);
   let score = 0;
 
@@ -365,22 +90,6 @@ function scoreDomUploadCandidate(candidate, hint, mediaKind, triggerAtlasId) {
 
   if (candidate.atlasId && candidate.atlasId === triggerAtlasId) {
     score += 40;
-  }
-
-  if (
-    haystack.includes("upload") ||
-    haystack.includes("attach") ||
-    haystack.includes("photo") ||
-    haystack.includes("video") ||
-    haystack.includes("media") ||
-    haystack.includes("image") ||
-    haystack.includes("file")
-  ) {
-    score += 18;
-  }
-
-  if (normalizedHint && haystack.includes(normalizedHint)) {
-    score += 14;
   }
 
   if (!candidate.accept) {
@@ -580,7 +289,7 @@ async function collectUploadCandidates({ page, triggerAtlasId, hint, mediaKind }
   return candidates
     .map((candidate) => ({
       ...candidate,
-      score: scoreDomUploadCandidate(candidate, hint, mediaKind, triggerAtlasId),
+      score: scoreDomUploadCandidate(candidate, mediaKind, triggerAtlasId),
     }))
     .sort((left, right) => right.score - left.score);
 }
@@ -802,74 +511,23 @@ async function executeAction({ action, canvas, observation, logger }) {
         },
       };
 
-    case "search_site": {
-      const element = findSearchElement(observation, action.inputHint || "search");
-
-      if (!element) {
-        throw new Error("Could not find a search input on the current page.");
-      }
-
-      logger.event("agent.executor", "action_target_resolved", {
-        type: action.type,
-        elementId: element.id,
-        purpose: element.purpose || "",
-        section: element.section || "",
-        descriptor: element.descriptor || "",
-        className: element.className || "",
-        nearbyText: element.nearbyText || "",
-        placeholder: element.placeholder || "",
-        label: element.label || "",
-      });
-
-      await canvas.insert(`[data-atlas-id="${element.id}"]`, action.query);
-
-      if (action.submit !== false) {
-        await canvas.press(action.submitKey || "Enter");
-        await canvas.settle();
-      }
-
-      return {
-        resolvedTarget: {
-          kind: "element",
-          elementId: element.id,
-          purpose: element.purpose || "",
-          section: element.section || "",
-          descriptor: element.descriptor || "",
-          className: element.className || "",
-          nearbyText: element.nearbyText || "",
-          placeholder: element.placeholder || "",
-          label: element.label || "",
-          text: element.text || "",
-        },
-      };
-    }
+    case "search_site":
+      throw targetRequired(
+        "search_site",
+        "search_site is deprecated. Use open_search, or resolve a concrete elementId and execute insert.",
+      );
 
     case "insert": {
-      let elementId = action.elementId;
-      let resolvedElement = null;
-
+      const elementId = actionElementId(action);
       if (!elementId) {
-        const element = findInsertElement(
-          observation,
-          action.inputHint || "",
-          action.text || "",
-        );
-        resolvedElement = element;
-        elementId = element ? element.id : "";
+        throw targetRequired("insert", "insert requires elementId. Target selection must be resolved by the model.", {
+          textPreview: String(action.text || "").slice(0, 120),
+        });
       }
 
-      if (!elementId && observation.pageSemantics?.focusedEditableId) {
-        elementId = observation.pageSemantics.focusedEditableId;
-        resolvedElement =
-          observation.interactive.find((element) => element.id === elementId) || null;
-      }
-
-      if (!elementId) {
-        throw new Error("Could not resolve an input target for insert.");
-      }
-
+      const resolvedElement = observation.interactive.find((element) => element.id === elementId) || null;
       if (!resolvedElement) {
-        resolvedElement = observation.interactive.find((element) => element.id === elementId) || null;
+        throw targetNotFound("insert", elementId);
       }
 
       logger.event("agent.executor", "action_target_resolved", {
@@ -882,7 +540,7 @@ async function executeAction({ action, canvas, observation, logger }) {
         nearbyText: resolvedElement?.nearbyText || "",
         placeholder: resolvedElement?.placeholder || "",
         label: resolvedElement?.label || "",
-        inputHint: action.inputHint || "",
+        targetReason: action.targetReason || "",
       });
 
       await canvas.insert(`[data-atlas-id="${elementId}"]`, action.text || "", {
@@ -908,12 +566,15 @@ async function executeAction({ action, canvas, observation, logger }) {
           placeholder: resolvedElement?.placeholder || "",
           label: resolvedElement?.label || "",
           text: resolvedElement?.text || "",
-          inputHint: action.inputHint || "",
+          targetReason: action.targetReason || "",
         },
       };
     }
 
-    case "type_element":
+    case "type_element": {
+      if (!actionElementId(action)) {
+        throw targetRequired("type_element", "type_element requires elementId.");
+      }
       await canvas.insert(`[data-atlas-id="${action.elementId}"]`, action.text || "", {
         clear: action.clear !== false,
       });
@@ -928,8 +589,12 @@ async function executeAction({ action, canvas, observation, logger }) {
           elementId: action.elementId,
         },
       };
+    }
 
-    case "click_element":
+    case "click_element": {
+      if (!actionElementId(action)) {
+        throw targetRequired("click_element", "click_element requires elementId.");
+      }
       await canvas.click(`[data-atlas-id="${action.elementId}"]`, {
         note: action.note || "",
       });
@@ -940,32 +605,16 @@ async function executeAction({ action, canvas, observation, logger }) {
           elementId: action.elementId,
         },
       };
+    }
 
     case "click_by_text": {
-      const element = findTextElement(observation, action.text);
-
-      if (!element) {
-        throw new Error(`Could not resolve an element for text "${action.text}".`);
-      }
-
-      await canvas.click(`[data-atlas-id="${element.id}"]`, {
-        note: action.note || "",
-      });
-      await canvas.settle();
-      return {
-        resolvedTarget: {
-          kind: "element",
-          elementId: element.id,
-          purpose: element.purpose || "",
-          section: element.section || "",
-          descriptor: element.descriptor || "",
-          className: element.className || "",
-          nearbyText: element.nearbyText || "",
-          placeholder: element.placeholder || "",
-          label: element.label || "",
-          text: element.text || "",
+      throw targetRequired(
+        "click_by_text",
+        "click_by_text is deprecated. The model must resolve a concrete elementId and execute click_element.",
+        {
+          text: action.text || "",
         },
-      };
+      );
     }
 
     case "press_key":
@@ -1017,19 +666,23 @@ async function executeAction({ action, canvas, observation, logger }) {
 
       const mediaKind = compact(selectedMedia[0]?.kind || "file");
       let resolvedElement = null;
-      let elementId = compact(action.elementId);
+      let elementId = actionElementId(action);
 
       if (elementId) {
         resolvedElement = observation.interactive.find((element) => element.id === elementId) || null;
       }
 
       if (!resolvedElement) {
-        resolvedElement = findUploadElement(
-          observation,
-          action.inputHint || action.note || "upload media",
+        if (!elementId) {
+          throw targetRequired("upload_media", "upload_media requires elementId. Target selection must be resolved by the model.", {
+            mediaRef: action.mediaRef || "first_media",
+            mediaKind,
+          });
+        }
+        throw targetNotFound("upload_media", elementId, {
+          mediaRef: action.mediaRef || "first_media",
           mediaKind,
-        );
-        elementId = resolvedElement?.id || "";
+        });
       }
 
       if (!elementId) {
@@ -1050,7 +703,7 @@ async function executeAction({ action, canvas, observation, logger }) {
         className: resolvedElement?.className || "",
         nearbyText: resolvedElement?.nearbyText || "",
         label: resolvedElement?.label || "",
-        inputHint: action.inputHint || "",
+        targetReason: action.targetReason || "",
       });
 
       const uploadResult = await uploadViaRuntime({
@@ -1060,7 +713,7 @@ async function executeAction({ action, canvas, observation, logger }) {
         elementId,
         filePaths,
         mediaKind,
-        hint: action.inputHint || action.note || "upload media",
+        hint: action.targetReason || action.note || "",
       });
 
       await canvas.settle();
@@ -1096,9 +749,6 @@ async function executeAction({ action, canvas, observation, logger }) {
 
 module.exports = {
   executeAction,
-  findInsertElement,
-  findSearchElement,
-  findUploadElement,
   collectUploadCandidates,
   uploadViaRuntime,
 };

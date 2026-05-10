@@ -22,9 +22,8 @@ function scoreInputCandidate(element) {
   const purpose = compact(element?.purpose);
   const section = compact(element?.section);
 
-  if (purpose === "chat_input") score += 30;
-  if (purpose === "text_input") score += 24;
-  if (purpose === "search_input") score += 12;
+  if (purpose === "editable") score += 30;
+  if (purpose === "file_input") score -= 20;
   if (element?.focused) score += 18;
   if (section === "composer") score += 16;
   if (section === "dialog") score += 14;
@@ -53,10 +52,8 @@ function scoreClickCandidate(element) {
   if (section === "dialog") score += 18;
   if (section === "composer") score += 16;
   if (section === "main") score += 6;
-  if (purpose === "send_button") score += 12;
-  if (keywordScore(labelSource, ["post", "publish", "share", "send", "save", "done", "next", "continue"])) {
-    score += 22;
-  }
+  if (purpose === "button") score += 12;
+  if (purpose === "link") score += 8;
   if (labelSource) score += 5;
   if (element?.disabled) score -= 20;
 
@@ -78,34 +75,30 @@ function scoreNavigationCandidate(element) {
   return score;
 }
 
-function keywordScore(source, keywords) {
-  const haystack = compact(source);
+function rankUploadCandidate(element) {
   let score = 0;
+  const tag = compact(element?.tag);
+  const role = compact(element?.role);
+  const type = compact(element?.type);
 
-  for (const keyword of keywords) {
-    if (haystack.includes(keyword)) {
-      score += 4;
-    }
-  }
+  if (tag === "input" && type === "file") score += 80;
+  if (element?.accept) score += 24;
+  if (element?.multiple) score += 8;
+  if (tag === "button" || role === "button" || tag === "label") score += 12;
+  if (element?.focused) score += 4;
+  if (element?.disabled) score -= 40;
 
   return score;
 }
 
 function scoreSearchCandidate(element) {
   let score = 0;
-  const haystack = [
-    element?.purpose,
-    element?.visibleName,
-    element?.placeholder,
-    element?.label,
-    element?.nearbyText,
-    element?.descriptor,
-  ]
-    .map(compact)
-    .join(" ");
 
-  if (compact(element?.purpose) === "search_input") score += 30;
-  if (haystack.includes("search") || haystack.includes("find")) score += 18;
+  if (compact(element?.purpose) === "editable") score += 24;
+  if (element?.tag === "input" || element?.tag === "textarea") score += 10;
+  if (compact(element?.role) === "textbox") score += 10;
+  if (compact(element?.placeholder)) score += 6;
+  if (compact(element?.visibleName)) score += 5;
   if (compact(element?.href)) score += 4;
   if (element?.focused) score += 6;
 
@@ -176,6 +169,24 @@ function selectCandidates(interactive, mode, expanded) {
       "disabled",
     ];
     scorer = scoreSearchCandidate;
+  } else if (mode === "upload") {
+    fields = [
+      "id",
+      "tag",
+      "role",
+      "type",
+      "accept",
+      "multiple",
+      "focused",
+      "disabled",
+      "visibleName",
+      "placeholder",
+      "label",
+      "nearbyText",
+      "text",
+      "descriptor",
+    ];
+    scorer = rankUploadCandidate;
   } else if (mode === "generic") {
     fields = [
       "id",

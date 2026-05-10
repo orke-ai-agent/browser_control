@@ -6,8 +6,10 @@ const { executeAction } = require("./executor");
 const {
   ANALYZER_SYSTEM,
   PLANNER_SYSTEM,
+  TARGET_RESOLVER_SYSTEM,
   buildAnalyzerPrompt,
   buildPlannerPrompt,
+  buildTargetResolverPrompt,
   buildVisualAnalyzerPrompt,
 } = require("./prompts");
 const { buildObservationPacket } = require("./context-packer");
@@ -24,6 +26,7 @@ const GEMINI_503_BACKOFF_MS = 1500;
 const ESSENTIAL_RUN_EVENTS = new Set([
   "run_started",
   "block_planned",
+  "action_target_model_resolved",
   "action_start",
   "action_target_resolved",
   "page_snapshot",
@@ -628,6 +631,64 @@ function collectPlannedActionIdentifiers(action) {
     .filter(Boolean);
 }
 
+function actionElementId(action) {
+  return String(action?.elementId || "").trim();
+}
+
+function targetModeForAction(action) {
+  const type = compactText(action?.type);
+
+  if (type === "insert" || type === "type_element") {
+    return "text_input";
+  }
+
+  if (type === "upload_media") {
+    return "upload";
+  }
+
+  if (type === "open_url" || type === "open_search") {
+    return "navigation";
+  }
+
+  return "generic";
+}
+
+function actionNeedsModelTarget(action) {
+  const type = compactText(action?.type);
+
+  if (["insert", "upload_media", "click_element", "type_element"].includes(type)) {
+    return !actionElementId(action);
+  }
+
+  return type === "click_by_text";
+}
+
+function applyResolvedTarget(action, resolution) {
+  const elementId = String(resolution?.elementId || "").trim();
+  const targetReason = String(resolution?.targetReason || "").trim();
+  const type = compactText(action?.type);
+
+  if (!elementId) {
+    return action;
+  }
+
+  if (type === "click_by_text") {
+    return {
+      ...action,
+      type: "click_element",
+      elementId,
+      targetReason,
+      note: action.note || action.text || action.label || "",
+    };
+  }
+
+  return {
+    ...action,
+    elementId,
+    targetReason,
+  };
+}
+
 function hasStrongIdentifierOverlap(entry, action) {
   const actionIdentifiers = collectPlannedActionIdentifiers(action);
   if (!actionIdentifiers.length) {
@@ -818,6 +879,73 @@ async function planWithRetry({
     planUsage,
     retryMode,
   };
+}
+
+async function resolveActionTargetWithModel({
+  threadId,
+  requestGemini,
+  observation,
+  userGoal,
+  action,
+  recentMessages,
+  lastError,
+  logger,
+}) {
+  if (!actionNeedsModelTarget(action)) {
+    return action;
+  }
+
+  const packet = buildObservationPacket(observation, {
+    mode: targetModeForAction(action),
+    expanded: true,
+  });
+  const result = await requestGemini(threadId, {
+    task: "resolve_target",
+    systemInstruction: TARGET_RESOLVER_SYSTEM,
+    prompt: buildTargetResolverPrompt({
+      userGoal,
+      observationPacket: packet,
+      action,
+      recentMessages,
+      lastError,
+    }),
+  });
+  const resolution = result.data || {};
+  const resolvedElementId = String(resolution.elementId || "").trim();
+  const candidateIds = new Set(
+    (packet.relevantElements || []).map((element) => String(element?.id || "").trim()).filter(Boolean),
+  );
+
+  if (!resolution.canResolve || !resolvedElementId) {
+    const error = new Error(
+      String(resolution.targetReason || "").trim() ||
+        `The model could not resolve a target for ${action?.type || "action"}.`,
+    );
+    error.name = "TargetResolutionError";
+    error.code = "TARGET_UNRESOLVED";
+    error.action = action;
+    error.resolution = resolution;
+    throw error;
+  }
+
+  if (!candidateIds.has(resolvedElementId)) {
+    const error = new Error(`The model returned elementId "${resolvedElementId}", but it was not in the target candidates.`);
+    error.name = "TargetResolutionError";
+    error.code = "TARGET_NOT_IN_CANDIDATES";
+    error.action = action;
+    error.resolution = resolution;
+    throw error;
+  }
+
+  const resolved = applyResolvedTarget(action, resolution);
+  logger.event("agent.service", "action_target_model_resolved", {
+    originalType: action?.type || "",
+    resolvedType: resolved?.type || "",
+    elementId: resolved.elementId || "",
+    targetReason: resolved.targetReason || "",
+    confidence: resolution.confidence || "",
+  });
+  return resolved;
 }
 
 function createAgentService({ env, logger, store, loadSettings, shortcutMemory, dashboardUrl }) {
@@ -1291,6 +1419,7 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
           }
 
           const observationBeforeAction = runtime.lastObservation || observation;
+          let executableAction = action;
           const actionResult = {
             type: action.type,
             label: describeAction(action),
@@ -1299,9 +1428,24 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
           };
 
           try {
+            executableAction = await resolveActionTargetWithModel({
+              threadId,
+              requestGemini: (targetThreadId, request) => requestGemini(targetThreadId, request, runLogger),
+              observation: observationBeforeAction,
+              userGoal,
+              action,
+              recentMessages: recentThreadMessages(store.getThread(threadId)),
+              lastError,
+              logger: runLogger,
+            });
+            actionResult.type = executableAction.type;
+            actionResult.label = describeAction(executableAction);
+            actionResult.targetReason = executableAction.targetReason || "";
+            actionResult.resolvedByModel = executableAction !== action;
+
             const executionResult = await executeAction({
               action: {
-                ...action,
+                ...executableAction,
                 resolveMediaSelection: (mediaRef) =>
                   resolveThreadMediaSelection(mediaAttachments, mediaRef),
               },
@@ -1315,7 +1459,7 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
                 actionResult.usedMedia = executionResult.resolvedTarget.usedMedia;
               }
               successfulActionMemories.push({
-                action,
+                action: executableAction,
                 observationBeforeAction,
                 resolvedTarget: executionResult.resolvedTarget,
               });

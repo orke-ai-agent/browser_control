@@ -31,7 +31,6 @@ function baseSiteFromHost(host) {
 
   const known = [
     "facebook",
-    "telegram",
     "wikipedia",
     "bing",
     "duckduckgo",
@@ -197,12 +196,6 @@ function inferPageKind({ host, pathName, observation }) {
       return "post_dialog";
     }
     if (pathName === "/" || !pathName) return "feed";
-  }
-
-  if (host.includes("telegram")) {
-    if (keywordMatch(`${title} ${body}`, ["telegram", "chat"])) {
-      return "chat";
-    }
   }
 
   if (keywordMatch(`${title} ${body}`, ["search results", "result"])) {

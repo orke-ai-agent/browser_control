@@ -44,10 +44,6 @@ async function captureObservation({ canvas, threadId, rootDir, logger, captureSc
           .slice(0, 12);
       }
 
-      function classHaystack(node) {
-        return classTokens(node).join(" ").toLowerCase();
-      }
-
       function ancestorClassSummary(element) {
         const parts = [];
         let current = element.parentElement;
@@ -76,7 +72,7 @@ async function captureObservation({ canvas, threadId, rootDir, logger, captureSc
           element.parentElement,
           element.closest("[class]"),
           element.parentElement?.querySelector('[class*="placeholder"], [class*="label"]'),
-          element.closest('[class*="input"], [class*="editor"], [class*="message"], [class*="search"]'),
+          element.closest("label, form, fieldset, [role='group']"),
         ].filter(Boolean);
 
         for (const candidate of candidates) {
@@ -106,24 +102,6 @@ async function captureObservation({ canvas, threadId, rootDir, logger, captureSc
           (element.getAttribute("placeholder") || "").trim() ||
           (element.getAttribute("aria-placeholder") || "").trim()
         ).slice(0, 160);
-      }
-
-      function semanticHaystack(element) {
-        return [
-          element.textContent,
-          element.getAttribute("aria-label"),
-          element.getAttribute("aria-placeholder"),
-          element.getAttribute("name"),
-          element.getAttribute("title"),
-          element.getAttribute("placeholder"),
-          element.getAttribute("type"),
-          element.getAttribute("role"),
-          resolveNearbyText(element),
-          classHaystack(element),
-          ancestorClassSummary(element),
-        ]
-          .map(compactText)
-          .join(" ");
       }
 
       function isVisible(element) {
@@ -165,20 +143,12 @@ async function captureObservation({ canvas, threadId, rootDir, logger, captureSc
           score += 50;
         }
 
-        if (purpose === "chat_input") {
-          score += 80;
-        } else if (purpose === "text_input") {
+        if (purpose === "editable") {
           score += 40;
-        } else if (purpose === "search_input") {
-          score += 20;
-        } else if (purpose === "send_button") {
+        } else if (purpose === "button") {
           score += 24;
         } else if (purpose === "file_input") {
           score += 56;
-        } else if (purpose === "upload_trigger") {
-          score += 30;
-        } else if (purpose === "new_chat") {
-          score += 12;
         }
 
         if (section === "main") {
@@ -196,104 +166,48 @@ async function captureObservation({ canvas, threadId, rootDir, logger, captureSc
         return score - index * 0.001;
       }
 
-      function inferPurpose(element) {
-        const haystack = semanticHaystack(element);
-
+      function isEditableElement(element) {
         const tag = element.tagName.toLowerCase();
-        const editable =
+        return (
           tag === "textarea" ||
           tag === "input" ||
           element.getAttribute("role") === "textbox" ||
           (element.hasAttribute("contenteditable") &&
-            element.getAttribute("contenteditable") !== "false");
+            element.getAttribute("contenteditable") !== "false")
+        );
+      }
 
-        if (editable) {
-          if (tag === "input" && compactText(element.getAttribute("type")) === "file") {
-            return "file_input";
-          }
+      function inferPurpose(element) {
+        const tag = element.tagName.toLowerCase();
+        const role = compactText(element.getAttribute("role"));
+        const type = compactText(element.getAttribute("type"));
 
-          if (
-            haystack.includes("search") ||
-            haystack.includes("find") ||
-            haystack.includes("поиск") ||
-            haystack.includes("искать") ||
-            haystack.includes("input-search") ||
-            haystack.includes("sidebar-header")
-          ) {
-            return "search_input";
-          }
-
-          if (
-            haystack.includes("message") ||
-            haystack.includes("send a message") ||
-            haystack.includes("ask anything") ||
-            haystack.includes("where should we begin") ||
-            haystack.includes("chat") ||
-            haystack.includes("prompt") ||
-            haystack.includes("сообщение") ||
-            haystack.includes("спросите") ||
-            haystack.includes("message composer") ||
-            haystack.includes("input-message") ||
-            haystack.includes("new-message-wrapper") ||
-            haystack.includes("composer")
-          ) {
-            return "chat_input";
-          }
-
-          return "text_input";
+        if (tag === "input" && type === "file") {
+          return "file_input";
         }
 
-        if (haystack.includes("new chat") || haystack.includes("новый чат")) {
-          return "new_chat";
+        if (isEditableElement(element)) {
+          return "editable";
         }
 
-        if (haystack.includes("send") || haystack.includes("отправ")) {
-          return "send_button";
+        if (tag === "button" || role === "button") {
+          return "button";
         }
 
-        if (
-          haystack.includes("upload") ||
-          haystack.includes("attach") ||
-          haystack.includes("photo") ||
-          haystack.includes("video") ||
-          haystack.includes("media") ||
-          haystack.includes("image") ||
-          haystack.includes("file")
-        ) {
-          return "upload_trigger";
+        if (tag === "a") {
+          return "link";
         }
 
-        if (haystack.includes("search") || haystack.includes("find")) {
-          return "search_trigger";
+        if (tag === "select") {
+          return "select";
         }
 
         return "generic";
       }
 
       function inferSection(element) {
-        const haystack = semanticHaystack(element);
-
         if (element.closest('[role="dialog"], dialog, [aria-modal="true"]')) {
           return "dialog";
-        }
-
-        if (
-          haystack.includes("sidebar") ||
-          haystack.includes("navigation") ||
-          haystack.includes("chatlist") ||
-          haystack.includes("search old-style") ||
-          haystack.includes("input-search")
-        ) {
-          return "sidebar";
-        }
-
-        if (
-          haystack.includes("new-message-wrapper") ||
-          haystack.includes("input-message-container") ||
-          haystack.includes("composer") ||
-          haystack.includes("footer")
-        ) {
-          return "composer";
         }
 
         if (element.closest("header, [role='banner']")) {

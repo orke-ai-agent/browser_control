@@ -32,9 +32,8 @@ function formatPrimaryActions(interactive) {
       const isActionLike =
         element.tag === "button" ||
         element.role === "button" ||
-        element.purpose === "send_button" ||
-        element.section === "dialog" ||
-        element.section === "composer";
+        element.purpose === "button" ||
+        element.section === "dialog";
 
       return hasVisibleName && isActionLike;
     })
@@ -257,20 +256,19 @@ Keep the block short: 1 to 3 actions.
 Allowed action types:
 - open_url { "type": "open_url", "url": "https://..." }
 - open_search { "type": "open_search", "query": "...", "engine": "duckduckgo|bing|ya" }
-- insert { "type": "insert", "text": "...", "elementId": "optional atlas-...", "inputHint": "optional human hint", "submit": false, "submitKey": "optional Enter" }
+- insert { "type": "insert", "text": "...", "elementId": "required atlas-... when an input is visible", "submit": false, "submitKey": "optional Enter", "targetReason": "why this element is the right target" }
 - click_element { "type": "click_element", "elementId": "atlas-..." }
-- click_by_text { "type": "click_by_text", "text": "...", "note": "optional reason" }
 - press_key { "type": "press_key", "key": "Enter" }
 - scroll { "type": "scroll", "deltaY": 320, "note": "optional reason" }
 - read_page { "type": "read_page", "loops": 1 }
-- upload_media { "type": "upload_media", "mediaRef": "first_media|first_image|first_video|all_media|all_images|all_videos|media:<id>", "elementId": "optional atlas-...", "inputHint": "optional human hint", "note": "optional reason" }
+- upload_media { "type": "upload_media", "mediaRef": "first_media|first_image|first_video|all_media|all_images|all_videos|media:<id>", "elementId": "required atlas-... when an upload/attach target is visible", "note": "optional reason", "targetReason": "why this element is the right upload target" }
 
 Every action must also include:
 - label: short UI label in the same language as the user's latest message, for example "Open Wikipedia" or "Type search query"
 - shortcutKey: optional recipe key when you are intentionally reusing one of the retrieved site shortcuts
 
 Rules:
-- Prefer elementId actions when the current page already exposes a matching target.
+- Use elementId actions when the current page already exposes a matching target. For insert, click_element, and upload_media, selecting the concrete target is part of your job as the model.
 - Session memory has higher priority than shortcuts, weak heuristics, and vague guesses.
 - Retrieved site shortcuts are optional accelerators, not commands. Reuse them only if the current page signals clearly match the shortcut target hints.
 - If a retrieved shortcut looks close but not exact, ignore it and plan from scratch.
@@ -302,7 +300,7 @@ Rules:
 - Use all_media, all_images, or all_videos only when the page likely supports multiple uploads and the user intent clearly wants multiple files.
 - Prefer insert for entering text. The browser layer already handles humanized typing under the hood.
 - Never paste the raw task instruction into a public composer, caption field, message box, or post body unless the user explicitly asked to publish that exact text.
-- Treat requests like "post this to Facebook", "upload this photo", "send it in Telegram", or "publish this image" as control instructions for you, not as end-user content.
+- Treat requests like "post this to Facebook", "upload this photo", "send this file", or "publish this image" as control instructions for you, not as end-user content.
 - If a publish composer is ready and media-only posting is possible, prefer leaving the text field empty over inventing or copying task wording into the post.
 - If a publish composer is already open, prefer the nearest in-composer attach/upload affordance. Avoid extra "add media", "gallery", "album", "photo/video", or media-library detours when a local attach target already exists.
 - If the composer already shows the uploaded media preview, treat media attachment as complete and continue toward the final publish CTA.
@@ -310,16 +308,16 @@ Rules:
 - When in doubt, use upload_media instead of click_element for media attachment steps.
 - After clicking a final publish CTA such as Post, Publish, Share, Send, Save, or Done, do not immediately restart the flow.
 - If the execution journal shows a recent final publish click, first verify success on the current page before reopening the composer or re-uploading media.
-- For insert, inputHint must be plain human language such as "main chat composer", "site search field", or "email field", never an atlas element id.
-- Distinguish between search UI and primary task UI. Never type into a search field if the user's goal is to send a chat message, fill a form, or write content.
-- If both a dialog search input and a main page composer are visible, prefer the element whose purpose best matches the user goal.
-- Use pageSemantics, purpose, section, placeholder, and focused state to choose the right field.
+- Do not rely on inputHint for target resolution. If a relevant element is visible, emit its concrete elementId and explain the choice in targetReason.
+- Distinguish between search UI and primary task UI by reading the raw element facts and page context. Never type into the wrong field just because it is editable.
+- If multiple editable controls are visible, choose by visible label, placeholder, nearby text, current focus, bounds, and surrounding page state.
+- Use pageSemantics, mechanical purpose, section, placeholder, nearby text, and focused state to choose the right field.
 - Highest-priority signal for a button is its visible text label.
 - Highest-priority signal for an input is its placeholder or nearby placeholder/label text.
 - For important confirmation buttons like Post, Share, Publish, Send, Save, Done, rely on the currently visible action candidates, not on previous assumptions.
 - If the page shows a creation dialog or composer, verify the exact visible CTA text before clicking.
 - If the page shows an active publish composer after media upload, prefer finishing the publish flow now over exploratory reading loops.
-- If the goal is to send a message in a chat product, prefer a "chat_input" in the "main" section over any "search_input" in a "dialog".
+- If the goal is to send a message in a chat product, choose the editable control that is visibly part of the active conversation/composer, not a navigation or search control.
 - Be aware of the remaining block budget and try to finish within it.
 - Never invent unsupported action names. Only use the allowed action types listed above.
 - Do not invent selectors.
@@ -330,6 +328,67 @@ Return JSON only in this exact shape:
   "comment": "Short first-person progress report in the same language as the user's latest message.",
   "blockGoal": "What this block is trying to achieve.",
   "actions": []
+}
+`.trim();
+}
+
+function buildTargetResolverPrompt({
+  userGoal,
+  observationPacket,
+  action,
+  recentMessages,
+  lastError,
+}) {
+  return `
+User goal:
+${userGoal}
+
+You are resolving the concrete browser target for one already-planned action.
+The runtime will not guess from keywords or CSS classes. You must choose a visible
+element id from the observation, or say that no safe target exists.
+
+Action needing a target:
+${JSON.stringify(action, null, 2)}
+
+Latest execution error:
+${lastError || "None"}
+
+Current page:
+${JSON.stringify(observationPacket.page, null, 2)}
+
+Page semantics:
+${JSON.stringify(observationPacket.pageSemantics || {}, null, 2)}
+
+Recent thread messages:
+${recentMessages.join("\n")}
+
+Relevant body text:
+${observationPacket.bodyText || "<empty>"}
+
+Interactive candidates:
+${formatInteractive(observationPacket.relevantElements || []) || "<none>"}
+
+Primary action candidates:
+${formatPrimaryActions(observationPacket.relevantElements || []) || "<none>"}
+
+Relevant HTML excerpt:
+${observationPacket.cleanedHtml || "<empty>"}
+
+Rules:
+- Return an elementId only if it appears in the interactive candidates.
+- Do not invent selectors, labels, or element ids.
+- Prefer the element that directly performs the intended action.
+- For insert, choose an editable input/textbox/contenteditable element.
+- For upload_media, choose the nearest visible upload/attach/file control for the current composer/form when possible.
+- For click_element, choose the exact visible control that should be clicked.
+- If no safe target exists, set canResolve to false and explain the missing state.
+
+Return JSON only:
+{
+  "canResolve": true,
+  "elementId": "atlas-...",
+  "targetReason": "Short reason grounded in visible facts.",
+  "confidence": "high|medium|low"
 }
 `.trim();
 }
@@ -631,10 +690,21 @@ upload_media is a native direct media attach capability and should not be analyz
 Treat any manual picker-style upload flow, gallery/library detour, or invented publish text as a planning failure.
 `.trim();
 
+const TARGET_RESOLVER_SYSTEM = `
+You are the target-resolution brain of a browser agent.
+Choose concrete element ids from structured observations.
+Output JSON only.
+Never use CSS selectors.
+Never invent element ids.
+If the observation is ambiguous or missing the right target, return canResolve false.
+`.trim();
+
 module.exports = {
   ANALYZER_SYSTEM,
   PLANNER_SYSTEM,
+  TARGET_RESOLVER_SYSTEM,
   buildAnalyzerPrompt,
   buildPlannerPrompt,
+  buildTargetResolverPrompt,
   buildVisualAnalyzerPrompt,
 };

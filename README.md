@@ -52,23 +52,6 @@ The backend loop is intentionally agentic:
 5. if DOM is weak, the backend falls back to screenshot analysis
 6. the UI receives short progress reports in the thread chat
 
-## Telegram Console
-
-The server can also expose the same browser-agent workflow through Telegram.
-
-When `TELEGRAM_BOT_TOKEN` is set in `.env`, `server.js` starts a Telegram long-polling bot that:
-
-- creates a new agent thread from the first chat message
-- keeps the current chat mapped to the active thread
-- lets the user start a new thread from the `New Thread` button or `/new`
-- forwards assistant block / report / error updates back into Telegram with emoji-rich step formatting
-- drives the same Playwright browser window and Gemini planning loop as the local web UI
-
-Optional safety setting:
-
-- `TELEGRAM_ALLOWED_CHAT_IDS`
-  Comma-separated list of Telegram chat IDs allowed to control the agent. If left empty, the bot accepts commands from any chat that can reach it.
-
 ## Universal Action API
 
 There is now a public local action endpoint for other apps and agents.
@@ -79,7 +62,7 @@ Use [`docs/ACTION_API.md`](./docs/ACTION_API.md) when you want to:
 - continue an existing thread from another app
 - attach one or more media files with JSON or `multipart/form-data`
 - let the planner work with abstract refs like `first_image` instead of raw file mechanics
-- reuse the same action flow from Telegram and the local UI
+- reuse the same action flow from the local UI and external callers
 
 ## Design principles
 
