@@ -33,6 +33,7 @@ const state = {
   activeId: "",
   draft: null,
   activeRunTicketId: "",
+  activeRunThreadId: "",
   activeThread: null,
   isStartingRun: false,
   filesByTicketId: {},
@@ -212,10 +213,83 @@ function activeRunStatus(ticket) {
   return ticket?.lastRunStatus || "not started";
 }
 
+function ticketRunHistory(ticket) {
+  const source = Array.isArray(ticket?.runHistory) ? ticket.runHistory : [];
+  const history = source
+    .map((run) => ({
+      threadId: String(run?.threadId || "").trim(),
+      runAt: String(run?.runAt || "").trim(),
+      status: String(run?.status || "").trim() || "submitted",
+      source: String(run?.source || "").trim() || "manual",
+    }))
+    .filter((run) => run.threadId);
+
+  if (!history.length && ticket?.lastThreadId) {
+    history.push({
+      threadId: ticket.lastThreadId,
+      runAt: ticket.lastRunAt || "",
+      status: ticket.lastRunStatus || "submitted",
+      source: "legacy",
+    });
+  }
+
+  return history;
+}
+
+function activeThreadIdForTicket(ticket) {
+  return state.activeRunThreadId || ticket?.lastThreadId || "";
+}
+
 function latestProgressMessage(thread) {
   const messages = Array.isArray(thread?.messages) ? thread.messages : [];
   const latest = [...messages].reverse().find((message) => message.role === "assistant") || messages[messages.length - 1];
   return latest?.text || "";
+}
+
+function formatDateTime(value) {
+  const date = new Date(value || "");
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  return date.toLocaleString(undefined, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function sanitizeRunLogText(value) {
+  const lines = String(value || "").split("\n");
+  const cleaned = [];
+  let droppingWrappedPath = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (droppingWrappedPath) {
+      if (trimmed.startsWith("/Users/") || trimmed.startsWith("/var/") || trimmed.startsWith("/tmp/")) {
+        continue;
+      }
+      droppingWrappedPath = false;
+    }
+
+    if (line.includes("local path:")) {
+      const beforePath = line.slice(0, line.indexOf("local path:")).trimEnd();
+      cleaned.push(beforePath.endsWith(",") ? `${beforePath.slice(0, -1)})` : beforePath);
+      droppingWrappedPath = true;
+      continue;
+    }
+
+    if (trimmed.startsWith("/Users/") || trimmed.startsWith("/var/") || trimmed.startsWith("/tmp/")) {
+      continue;
+    }
+
+    cleaned.push(line);
+  }
+
+  return cleaned.join("\n").replaceAll(" ()", "");
 }
 
 function buildTicketPrompt(ticket) {
@@ -616,6 +690,7 @@ function renderRunWidget() {
   panel.setAttribute("aria-label", "Ticket run details");
 
   const ticket = state.tickets.find((item) => item.id === state.activeRunTicketId);
+  const activeThreadId = activeThreadIdForTicket(ticket);
   const toolbar = document.createElement("div");
   toolbar.className = "editor-toolbar";
   const mode = document.createElement("span");
@@ -643,7 +718,7 @@ function renderRunWidget() {
   refresh.className = "secondary-action";
   refresh.type = "button";
   refresh.textContent = "Refresh";
-  refresh.disabled = !ticket?.lastThreadId;
+  refresh.disabled = !activeThreadId;
   refresh.addEventListener("click", () => refreshActiveRun());
   runActions.append(runNow, refresh);
   summaryWrap.append(runActions);
@@ -654,8 +729,8 @@ function renderRunWidget() {
   const cycle = Number(state.activeThread?.meta?.cycleCount || 0);
   const tokens = Number(state.activeThread?.meta?.totalTokens || 0);
   const latest = latestProgressMessage(state.activeThread);
-  summary.textContent = ticket?.lastThreadId
-    ? `Thread ${ticket.lastThreadId} · ${status} · cycle ${cycle} · ${tokens} tokens · ${ticket.lastRunAt || "no run time"}${latest ? `\n${latest}` : ""}`
+  summary.textContent = activeThreadId
+    ? `Thread ${activeThreadId} · ${status} · cycle ${cycle} · ${tokens} tokens · ${formatDateTime(ticket?.lastRunAt) || "no run time"}${latest ? `\n${sanitizeRunLogText(latest)}` : ""}`
     : "No previous run yet.";
   summaryWrap.append(summary);
   panel.append(summaryWrap);
@@ -667,20 +742,21 @@ function renderRunWidget() {
   if (!messages.length) {
     const empty = document.createElement("p");
     empty.className = "empty-board";
-    empty.textContent = ticket?.lastThreadId ? "Run is still loading or has no messages yet." : "This ticket has not returned a run yet.";
+    empty.textContent = activeThreadId ? "Run is still loading or has no messages yet." : "This ticket has not returned a run yet.";
     messagesWrap.append(empty);
     panel.append(messagesWrap);
     return panel;
   }
 
-  messages.forEach((message) => {
+  [...messages].reverse().forEach((message) => {
     const item = document.createElement("article");
     item.className = "run-message";
     const head = document.createElement("div");
     head.className = "run-message-head";
-    head.textContent = `${message.role || "message"} · ${message.kind || "text"}`;
+    const time = formatDateTime(message.timestamp);
+    head.textContent = `${time ? `${time} · ` : ""}${message.role || "message"} · ${message.kind || "text"}`;
     const body = document.createElement("pre");
-    body.textContent = message.text || JSON.stringify(message.meta || {}, null, 2);
+    body.textContent = sanitizeRunLogText(message.text || JSON.stringify(message.meta || {}, null, 2));
     item.append(head, body);
     messagesWrap.append(item);
   });
@@ -765,50 +841,108 @@ function renderFileBox() {
     });
   }
 
-  box.append(header, add, hint, grid, picker);
+  const runs = renderRunHistory(ticket);
+  box.append(header, add, hint, grid, runs, picker);
   elements.fileBoxRoot.append(box);
 }
 
-function render() {
+function renderRunHistory(ticket) {
+  const wrap = document.createElement("div");
+  wrap.className = "run-history";
+  const head = document.createElement("div");
+  head.className = "run-history-head";
+  head.textContent = "Previous Runs";
+  wrap.append(head);
+
+  const runs = ticketRunHistory(ticket);
+  if (!runs.length) {
+    const empty = document.createElement("div");
+    empty.className = "run-history-empty";
+    empty.textContent = "No runs yet";
+    wrap.append(empty);
+    return wrap;
+  }
+
+  runs.forEach((run) => {
+    const item = document.createElement("button");
+    item.className = `run-history-item${run.threadId === activeThreadIdForTicket(ticket) ? " is-active" : ""}`;
+    item.type = "button";
+    item.addEventListener("click", () => openTicketRun(ticket.id, run.threadId));
+
+    const title = document.createElement("span");
+    title.className = "run-history-title";
+    title.textContent = run.threadId;
+    const meta = document.createElement("span");
+    meta.className = "run-history-meta";
+    meta.textContent = `${run.status} · ${run.runAt || "no time"}`;
+    item.append(title, meta);
+    wrap.append(item);
+  });
+
+  return wrap;
+}
+
+function restoreWindowScroll(scrollTop, scrollLeft) {
+  requestAnimationFrame(() => {
+    const scrollingElement = document.scrollingElement || document.documentElement;
+    scrollingElement.scrollTop = scrollTop;
+    scrollingElement.scrollLeft = scrollLeft;
+  });
+}
+
+function render(options = {}) {
+  const scrollingElement = document.scrollingElement || document.documentElement;
+  const scrollTop = scrollingElement.scrollTop;
+  const scrollLeft = scrollingElement.scrollLeft;
   renderSidebar();
   elements.stageRoot.replaceChildren();
   if (state.draft) {
     elements.stageRoot.append(renderEditWidget());
     renderFileBox();
+    if (options.preserveScroll) {
+      restoreWindowScroll(scrollTop, scrollLeft);
+    }
     return;
   }
   if (state.activeRunTicketId) {
     elements.stageRoot.append(renderRunWidget());
     renderFileBox();
+    if (options.preserveScroll) {
+      restoreWindowScroll(scrollTop, scrollLeft);
+    }
     return;
   }
   elements.stageRoot.append(renderBoard());
   renderFileBox();
+  if (options.preserveScroll) {
+    restoreWindowScroll(scrollTop, scrollLeft);
+  }
 }
 
 async function refreshActiveRun(options = {}) {
   const ticket = state.tickets.find((item) => item.id === state.activeRunTicketId);
-  if (!ticket?.lastThreadId) {
+  const threadId = activeThreadIdForTicket(ticket);
+  if (!threadId) {
     return;
   }
 
   try {
-    const payload = await requestJson(`/api/threads/${ticket.lastThreadId}`);
+    const payload = await requestJson(`/api/threads/${threadId}`);
     state.activeThread = payload.thread || null;
     logEvent("ticket_run_refreshed", {
       id: ticket.id,
-      threadId: ticket.lastThreadId,
+      threadId,
       status: state.activeThread?.status || "",
     });
     if (state.activeThread?.status === "idle") {
       stopRunPolling();
     }
   } catch (error) {
-    logError("ticket_run_refresh_failed", error, { id: ticket.id, threadId: ticket.lastThreadId });
+    logError("ticket_run_refresh_failed", error, { id: ticket.id, threadId });
   }
 
   if (!options.silent || state.activeRunTicketId) {
-    render();
+    render({ preserveScroll: Boolean(options.silent) });
   }
 }
 
@@ -821,47 +955,20 @@ async function runTicketNow(id) {
   state.activeId = id;
   state.draft = null;
   state.activeRunTicketId = id;
+  state.activeRunThreadId = "";
   state.activeThread = null;
   render();
 
   try {
-    let payload;
-    try {
-      payload = await requestJson(`/api/tickets/${id}/run`, {
-        method: "POST",
-        body: JSON.stringify({}),
-      });
-    } catch (error) {
-      logError("ticket_run_endpoint_fallback", error, { id });
-      const ticket = state.tickets.find((item) => item.id === id);
-      if (!ticket) {
-        throw new Error("Ticket not found.");
-      }
-      const actionPayload = await requestJson("/api/actions", {
-        method: "POST",
-        body: JSON.stringify({
-          prompt: buildTicketPrompt(ticket),
-          newThread: true,
-        }),
-      });
-      const updatedTicket = {
-        ...ticket,
-        lastRunKey: `manual-${new Date().toISOString()}`,
-        lastRunAt: new Date().toISOString(),
-        lastRunStatus: "submitted",
-        lastThreadId: actionPayload.thread?.id || "",
-      };
-      upsertTicket(updatedTicket);
-      await saveTickets();
-      payload = {
-        ticket: updatedTicket,
-        thread: actionPayload.thread,
-      };
-    }
+    const payload = await requestJson(`/api/tickets/${id}/run`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
 
     if (payload.ticket) {
       upsertTicket(payload.ticket);
     }
+    state.activeRunThreadId = payload.thread?.id || payload.ticket?.lastThreadId || "";
     state.activeThread = payload.thread || null;
     logEvent("ticket_run_started", {
       id,
@@ -885,6 +992,7 @@ function openTicket(id) {
   state.activeId = id;
   state.draft = createDraft(ticket);
   state.activeRunTicketId = "";
+  state.activeRunThreadId = "";
   state.activeThread = null;
   stopRunPolling();
   logEvent("ticket_opened", { id });
@@ -892,7 +1000,7 @@ function openTicket(id) {
   render();
 }
 
-async function openTicketRun(id) {
+async function openTicketRun(id, threadId = "") {
   const ticket = state.tickets.find((item) => item.id === id);
   if (!ticket) {
     logError("ticket_run_open_failed", new Error("Ticket not found"), { id });
@@ -902,24 +1010,26 @@ async function openTicketRun(id) {
   state.activeId = id;
   state.draft = null;
   state.activeRunTicketId = id;
+  state.activeRunThreadId = String(threadId || ticket.lastThreadId || "").trim();
   state.activeThread = null;
   startRunPolling(id);
   loadTicketFiles(id).then(render);
   render();
 
-  if (!ticket.lastThreadId) {
+  if (!state.activeRunThreadId) {
     logEvent("ticket_run_empty", { id });
     return;
   }
 
   await refreshActiveRun();
-  logEvent("ticket_run_opened", { id, threadId: ticket.lastThreadId });
+  logEvent("ticket_run_opened", { id, threadId: state.activeRunThreadId });
 }
 
 function createTicket() {
   state.activeId = "";
   state.draft = createDraft();
   state.activeRunTicketId = "";
+  state.activeRunThreadId = "";
   state.activeThread = null;
   stopRunPolling();
   logEvent("ticket_create_started");
@@ -932,6 +1042,7 @@ function closeStageView() {
   state.activeId = "";
   state.draft = null;
   state.activeRunTicketId = "";
+  state.activeRunThreadId = "";
   state.activeThread = null;
   stopRunPolling();
   logEvent("stage_closed");

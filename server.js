@@ -228,8 +228,74 @@ function normalizeTicket(ticket) {
     lastRunAt: String(ticket.lastRunAt || ""),
     lastRunStatus: String(ticket.lastRunStatus || ""),
     lastThreadId: String(ticket.lastThreadId || ""),
+    runHistory: normalizeTicketRunHistory(ticket),
     fileCount: listTicketFiles(id).length,
   };
+}
+
+function normalizeTicketRunHistory(ticket) {
+  const source = Array.isArray(ticket?.runHistory) ? ticket.runHistory : [];
+  const history = source
+    .map((run) => ({
+      threadId: String(run?.threadId || "").trim(),
+      runKey: String(run?.runKey || "").trim(),
+      runAt: String(run?.runAt || "").trim(),
+      status: String(run?.status || "").trim() || "submitted",
+      source: String(run?.source || "").trim() || "manual",
+    }))
+    .filter((run) => run.threadId);
+
+  if (!history.length && ticket?.lastThreadId) {
+    history.push({
+      threadId: String(ticket.lastThreadId || "").trim(),
+      runKey: String(ticket.lastRunKey || "").trim(),
+      runAt: String(ticket.lastRunAt || "").trim(),
+      status: String(ticket.lastRunStatus || "").trim() || "submitted",
+      source: "legacy",
+    });
+  }
+
+  const ticketTitlePrefix = `Execute scheduled ticket: ${String(ticket?.title || "").trim()}`;
+  if (ticketTitlePrefix.trim()) {
+    for (const thread of store.listThreads()) {
+      const title = String(thread.title || "");
+      if (!title.startsWith(ticketTitlePrefix)) {
+        continue;
+      }
+      history.push({
+        threadId: thread.id,
+        runKey: "",
+        runAt: thread.updatedAt || "",
+        status: thread.status || "submitted",
+        source: "thread_store",
+      });
+    }
+  }
+
+  const byThread = new Map();
+  for (const run of history) {
+    byThread.set(run.threadId, run);
+  }
+
+  return [...byThread.values()]
+    .sort((left, right) => String(right.runAt || "").localeCompare(String(left.runAt || "")))
+    .slice(0, 30);
+}
+
+function appendTicketRunHistory(ticket, run) {
+  return normalizeTicketRunHistory({
+    ...ticket,
+    runHistory: [
+      {
+        threadId: run.threadId,
+        runKey: run.runKey,
+        runAt: run.runAt,
+        status: run.status || "submitted",
+        source: run.source || "manual",
+      },
+      ...(Array.isArray(ticket?.runHistory) ? ticket.runHistory : []),
+    ],
+  });
 }
 
 function loadTickets() {
@@ -272,6 +338,12 @@ function saveTickets(tickets) {
         lastRunAt: normalizedTicket.lastRunAt || existing?.lastRunAt || "",
         lastRunStatus: normalizedTicket.lastRunStatus || existing?.lastRunStatus || "",
         lastThreadId: normalizedTicket.lastThreadId || existing?.lastThreadId || "",
+        runHistory: normalizeTicketRunHistory({
+          ...normalizedTicket,
+          runHistory: normalizedTicket.runHistory?.length
+            ? normalizedTicket.runHistory
+            : existing?.runHistory || [],
+        }),
       };
 
       if (scheduleChanged && isTicketDue(mergedTicket, now)) {
@@ -448,11 +520,32 @@ function isTicketDue(ticket, now = new Date()) {
   return !ticket.lastRunAt && currentMinute >= schedule.minuteOfDay;
 }
 
+function isTicketInScheduleWindow(ticket, now = new Date()) {
+  const schedule = parseTicketMinuteOfDay(ticket);
+  const currentMinute = localMinuteOfDay(now);
+
+  if (ticket.frequency === "hourly") {
+    return now.getMinutes() === schedule.minute;
+  }
+
+  if (ticket.frequency === "weekly") {
+    const created = new Date(ticket.createdAt);
+    const weekday = Number.isNaN(created.getTime()) ? now.getDay() : created.getDay();
+    return now.getDay() === weekday && currentMinute >= schedule.minuteOfDay;
+  }
+
+  if (ticket.frequency === "daily") {
+    return currentMinute >= schedule.minuteOfDay;
+  }
+
+  return currentMinute >= schedule.minuteOfDay;
+}
+
 function buildTicketPrompt(ticket) {
   const steps = ticket.steps.map((step, index) => `${index + 1}. ${step}`).join("\n");
   const files = listTicketFiles(ticket.id);
   const fileLines = files.length
-    ? files.map((file, index) => `${index + 1}. ${file.name} (${file.mimeType}, ${file.size} bytes, local path: ${file.path})`).join("\n")
+    ? files.map((file, index) => `${index + 1}. ${file.name} (${file.mimeType}, ${file.size} bytes)`).join("\n")
     : "No files in this ticket asset box.";
   return [
     `Execute scheduled ticket: ${ticket.title}`,
@@ -466,13 +559,101 @@ function buildTicketPrompt(ticket) {
 }
 
 const runningScheduledTickets = new Set();
+const pendingManualTicketRuns = new Map();
+const activeTicketRuns = new Map();
+
+function isActiveThread(thread) {
+  return ["running", "stopping", "submitted"].includes(String(thread?.status || ""));
+}
+
+function activeTicketRun(ticketId) {
+  const active = activeTicketRuns.get(ticketId);
+  if (!active) {
+    return null;
+  }
+
+  if (!active.threadId) {
+    return active;
+  }
+
+  const thread = store.getThread(active.threadId);
+  if (isActiveThread(thread)) {
+    return {
+      ...active,
+      thread,
+    };
+  }
+
+  activeTicketRuns.delete(ticketId);
+  return null;
+}
+
+function releaseTicketRunWhenIdle(ticketId, threadId) {
+  const startedAt = Date.now();
+  const poll = () => {
+    const active = activeTicketRuns.get(ticketId);
+    if (!active || active.threadId !== threadId) {
+      return;
+    }
+
+    const thread = store.getThread(threadId);
+    const timedOut = Date.now() - startedAt > 2 * 60 * 60 * 1000;
+    if (!isActiveThread(thread) || timedOut) {
+      activeTicketRuns.delete(ticketId);
+      logger.event("tickets.run_lock", "released", {
+        ticketId,
+        threadId,
+        status: thread?.status || "",
+        timedOut,
+      });
+      return;
+    }
+
+    setTimeout(poll, 2000);
+  };
+
+  setTimeout(poll, 2000);
+}
+
+function setActiveTicketRun(ticketId, record) {
+  activeTicketRuns.set(ticketId, {
+    ticketId,
+    startedAt: new Date().toISOString(),
+    ...record,
+  });
+}
 
 async function runScheduledTicket(ticket, runKey) {
-  if (runningScheduledTickets.has(ticket.id)) {
+  const active = activeTicketRun(ticket.id);
+  if (runningScheduledTickets.has(ticket.id) || active) {
+    logger.event("tickets.scheduler", "ticket_due_skipped_active_run", {
+      ticketId: ticket.id,
+      runKey,
+      activeThreadId: active?.threadId || "",
+      activeSource: active?.source || "",
+    });
+    return;
+  }
+
+  const latestTickets = loadTickets();
+  const latestTicket = latestTickets.find((item) => item.id === ticket.id) || ticket;
+  const lastThread = latestTicket.lastThreadId ? store.getThread(latestTicket.lastThreadId) : null;
+  if (isActiveThread(lastThread)) {
+    logger.event("tickets.scheduler", "ticket_due_skipped_running_thread", {
+      ticketId: ticket.id,
+      runKey,
+      threadId: lastThread.id,
+      status: lastThread.status,
+    });
     return;
   }
 
   runningScheduledTickets.add(ticket.id);
+  setActiveTicketRun(ticket.id, {
+    source: "scheduler",
+    runKey,
+    promise: null,
+  });
   logger.event("tickets.scheduler", "ticket_due", {
     ticketId: ticket.id,
     title: ticket.title,
@@ -487,27 +668,57 @@ async function runScheduledTicket(ticket, runKey) {
       media: ticketFilesAsMedia(ticket.id),
       forceNewThread: true,
       source: "ticket_scheduler",
+      userMeta: {
+        ticketId: ticket.id,
+        ticketTitle: ticket.title,
+        runKey,
+        runSource: "scheduler",
+      },
+    });
+    const threadId = result.thread?.id || "";
+    setActiveTicketRun(ticket.id, {
+      source: "scheduler",
+      runKey,
+      threadId,
+      promise: Promise.resolve({
+        ticket: null,
+        thread: result.thread,
+      }),
     });
 
     const tickets = loadTickets();
     const index = tickets.findIndex((item) => item.id === ticket.id);
     if (index >= 0) {
+      const runAt = new Date().toISOString();
       tickets[index] = {
         ...tickets[index],
         lastRunKey: runKey,
-        lastRunAt: new Date().toISOString(),
+        lastRunAt: runAt,
         lastRunStatus: "submitted",
-        lastThreadId: result.thread?.id || "",
+        lastThreadId: threadId,
+        runHistory: appendTicketRunHistory(tickets[index], {
+          threadId,
+          runKey,
+          runAt,
+          status: result.thread?.status || "submitted",
+          source: "scheduler",
+        }),
       };
       saveTickets(tickets);
     }
 
     logger.event("tickets.scheduler", "ticket_submitted", {
       ticketId: ticket.id,
-      threadId: result.thread?.id || "",
+      threadId,
       runKey,
     });
+    if (threadId) {
+      releaseTicketRunWhenIdle(ticket.id, threadId);
+    } else {
+      activeTicketRuns.delete(ticket.id);
+    }
   } catch (error) {
+    activeTicketRuns.delete(ticket.id);
     logger.error("tickets.scheduler", "ticket_submit_failed", error, {
       ticketId: ticket.id,
       runKey,
@@ -518,6 +729,45 @@ async function runScheduledTicket(ticket, runKey) {
 }
 
 async function runTicketNow(ticketId) {
+  const active = activeTicketRun(ticketId);
+  if (active) {
+    logger.event("tickets.manual", "ticket_run_reused_active_lock", {
+      ticketId,
+      threadId: active.threadId || "",
+      source: active.source || "",
+    });
+    if (active.promise) {
+      return active.promise;
+    }
+    const thread = active.threadId ? store.getThread(active.threadId) : null;
+    if (thread) {
+      const tickets = loadTickets();
+      const ticket = tickets.find((item) => item.id === ticketId) || null;
+      return {
+        ticket: ticket
+          ? {
+              ...ticket,
+              lastRunStatus: thread.status,
+            }
+          : null,
+        thread,
+        reused: true,
+      };
+    }
+  }
+
+  if (pendingManualTicketRuns.has(ticketId)) {
+    return pendingManualTicketRuns.get(ticketId);
+  }
+
+  const runPromise = runTicketNowOnce(ticketId).finally(() => {
+    pendingManualTicketRuns.delete(ticketId);
+  });
+  pendingManualTicketRuns.set(ticketId, runPromise);
+  return runPromise;
+}
+
+async function runTicketNowOnce(ticketId) {
   const tickets = loadTickets();
   const index = tickets.findIndex((item) => item.id === ticketId);
 
@@ -526,36 +776,108 @@ async function runTicketNow(ticketId) {
   }
 
   const ticket = tickets[index];
+  const lastThread = ticket.lastThreadId ? store.getThread(ticket.lastThreadId) : null;
+  if (lastThread && ["running", "stopping"].includes(String(lastThread.status || ""))) {
+    logger.event("tickets.manual", "ticket_run_reused_active_thread", {
+      ticketId: ticket.id,
+      threadId: lastThread.id,
+      status: lastThread.status,
+    });
+    return {
+      ticket: {
+        ...ticket,
+        lastRunStatus: lastThread.status,
+      },
+      thread: lastThread,
+      reused: true,
+    };
+  }
+
   const now = new Date();
   const scheduledRunKey = runKeyForTicket(ticket, now);
-  const runKey = isTicketDue(ticket, now) ? scheduledRunKey : `manual-${now.toISOString()}`;
+  const runKey = isTicketInScheduleWindow(ticket, now) ? scheduledRunKey : `manual-${now.toISOString()}`;
   logger.event("tickets.manual", "ticket_run_requested", {
     ticketId: ticket.id,
     title: ticket.title,
     runKey,
   });
 
-  const result = await actionController.submit({
-    prompt: buildTicketPrompt(ticket),
-    media: ticketFilesAsMedia(ticket.id),
-    forceNewThread: true,
-    source: "ticket_manual",
+  setActiveTicketRun(ticket.id, {
+    source: "manual",
+    runKey,
+    promise: null,
   });
+
+  let result;
+  try {
+    result = await actionController.submit({
+      prompt: buildTicketPrompt(ticket),
+      media: ticketFilesAsMedia(ticket.id),
+      forceNewThread: true,
+      source: "ticket_manual",
+      userMeta: {
+        ticketId: ticket.id,
+        ticketTitle: ticket.title,
+        runKey,
+        runSource: "manual",
+      },
+    });
+  } catch (error) {
+    activeTicketRuns.delete(ticket.id);
+    throw error;
+  }
+  const threadId = result.thread?.id || "";
+  setActiveTicketRun(ticket.id, {
+    source: "manual",
+    runKey,
+    threadId,
+    promise: null,
+  });
+
+  const responsePromise = Promise.resolve().then(() => {
+    const latestTickets = loadTickets();
+    const latestTicket = latestTickets.find((item) => item.id === ticket.id) || null;
+    return {
+      ticket: latestTicket,
+      thread: result.thread,
+    };
+  });
+  setActiveTicketRun(ticket.id, {
+    source: "manual",
+    runKey,
+    threadId,
+    promise: responsePromise,
+  });
+
+  const runAt = new Date().toISOString();
 
   tickets[index] = {
     ...tickets[index],
     lastRunKey: runKey,
-    lastRunAt: new Date().toISOString(),
+    lastRunAt: runAt,
     lastRunStatus: "submitted",
-    lastThreadId: result.thread?.id || "",
+    lastThreadId: threadId,
+    runHistory: appendTicketRunHistory(tickets[index], {
+      threadId,
+      runKey,
+      runAt,
+      status: result.thread?.status || "submitted",
+      source: "manual",
+    }),
   };
   const savedTickets = saveTickets(tickets);
 
   logger.event("tickets.manual", "ticket_submitted", {
     ticketId: ticket.id,
-    threadId: result.thread?.id || "",
+    threadId,
     runKey,
   });
+
+  if (threadId) {
+    releaseTicketRunWhenIdle(ticket.id, threadId);
+  } else {
+    activeTicketRuns.delete(ticket.id);
+  }
 
   return {
     ticket: savedTickets[index],

@@ -23,6 +23,8 @@ function summariseInteractive(element) {
     nearbyText: element.nearbyText,
     descriptor: element.descriptor,
     visibleName: element.visibleName,
+    bounds: element.bounds,
+    inViewport: element.inViewport,
   };
 }
 
@@ -155,8 +157,6 @@ async function captureObservation({ canvas, threadId, rootDir, logger, captureSc
           score += 18;
         } else if (section === "dialog") {
           score += 4;
-        } else if (section === "navigation") {
-          score -= 8;
         }
 
         if (document.activeElement === element) {
@@ -253,7 +253,31 @@ async function captureObservation({ canvas, threadId, rootDir, logger, captureSc
 
       const interactiveNodes = Array.from(
         document.querySelectorAll(
-          'a, button, input, textarea, select, [role="button"], [role="textbox"], [contenteditable]:not([contenteditable="false"])',
+          [
+            "a",
+            "button",
+            "input",
+            "textarea",
+            "select",
+            "[role='button']",
+            "[role='link']",
+            "[role='textbox']",
+            "[role='checkbox']",
+            "[role='radio']",
+            "[role='combobox']",
+            "[role='menuitem']",
+            "[role='tab']",
+            "[role='switch']",
+            "[aria-label]",
+            "[aria-labelledby]",
+            "[title]",
+            "[data-tooltip]",
+            "[aria-haspopup]",
+            "[onclick]",
+            "[jsaction]",
+            "[tabindex]:not([tabindex='-1'])",
+            "[contenteditable]:not([contenteditable='false'])",
+          ].join(", "),
         ),
       ).filter(isVisible);
 
@@ -270,6 +294,7 @@ async function captureObservation({ canvas, threadId, rootDir, logger, captureSc
         const assignedId = element.dataset.atlasId || `atlas-${Date.now()}-${index}`;
         element.dataset.atlasId = assignedId;
         const descriptor = buildDescriptor(element);
+        const rect = element.getBoundingClientRect();
 
         return {
           id: assignedId,
@@ -308,6 +333,17 @@ async function captureObservation({ canvas, threadId, rootDir, logger, captureSc
           nearbyText: descriptor.nearbyText,
           descriptor: descriptor.summary,
           visibleName: descriptor.visibleName,
+          bounds: {
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+          },
+          inViewport:
+            rect.bottom >= 0 &&
+            rect.right >= 0 &&
+            rect.top <= window.innerHeight &&
+            rect.left <= window.innerWidth,
         };
       });
 
@@ -343,6 +379,12 @@ async function captureObservation({ canvas, threadId, rootDir, logger, captureSc
         cleanedHtml: clone ? clone.innerHTML.replace(/\s+/g, " ").trim().slice(0, 8000) : "",
         interactive,
         pageSemantics: {
+          viewport: {
+            width: window.innerWidth,
+            height: window.innerHeight,
+            scrollX: Math.round(window.scrollX),
+            scrollY: Math.round(window.scrollY),
+          },
           dialogOpen: Boolean(document.querySelector('[role="dialog"], dialog, [aria-modal="true"]')),
           activeElementTag: document.activeElement ? document.activeElement.tagName.toLowerCase() : "",
           activeElementRole: document.activeElement ? document.activeElement.getAttribute("role") || "" : "",
@@ -367,6 +409,12 @@ async function captureObservation({ canvas, threadId, rootDir, logger, captureSc
       cleanedHtml: "",
       interactive: [],
       pageSemantics: {
+        viewport: {
+          width: 0,
+          height: 0,
+          scrollX: 0,
+          scrollY: 0,
+        },
         dialogOpen: false,
         activeElementTag: "",
         activeElementRole: "",
@@ -375,6 +423,16 @@ async function captureObservation({ canvas, threadId, rootDir, logger, captureSc
         focusedEditablePurpose: "",
       },
     };
+  }
+
+  let ariaSnapshot = "";
+  try {
+    ariaSnapshot = await page.locator("body").ariaSnapshot({ timeout: 1200 });
+  } catch (error) {
+    logger.warn("agent.observe", "aria_snapshot_failed", {
+      threadId,
+      reason: error instanceof Error ? error.message : String(error),
+    });
   }
 
   let screenshotPath = "";
@@ -413,6 +471,7 @@ async function captureObservation({ canvas, threadId, rootDir, logger, captureSc
     cleanedHtml: observation.cleanedHtml,
     interactive: observation.interactive.map(summariseInteractive),
     pageSemantics: observation.pageSemantics,
+    ariaSnapshot: String(ariaSnapshot || "").slice(0, 6000),
     screenshotPath,
   };
 }

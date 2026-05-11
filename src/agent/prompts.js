@@ -18,6 +18,8 @@ function formatInteractive(interactive) {
         nearbyText: element.nearbyText,
         descriptor: element.descriptor,
         href: element.href,
+        bounds: element.bounds,
+        inViewport: element.inViewport,
       }),
     )
     .join("\n");
@@ -48,6 +50,8 @@ function formatPrimaryActions(interactive) {
         purpose: element.purpose,
         section: element.section,
         descriptor: element.descriptor,
+        bounds: element.bounds,
+        inViewport: element.inViewport,
       }),
     )
     .join("\n");
@@ -175,17 +179,17 @@ Agent identity and operating contract:
 - The user's request is the source of truth for what must be accomplished.
 - Your job is to interpret the request as an execution task, not as public-facing text to paste into websites.
 - Attached thread media are real assets available to you through upload_media.
-- upload_media is your native direct media-injection capability. Treat it as an atomic attach step handled by the runtime, not as a manual OS file-picking workflow you need to reason about.
-- When you choose upload_media, your job is only to pick the best current page target or composer area. The runtime may use a hidden file input, an associated label/button, or a filechooser behind the scenes.
+- upload_media is your native clipboard-paste file delivery capability. Treat it as an atomic paste step handled by the runtime, not as a manual OS file-picking workflow you need to reason about.
+- When you choose upload_media, your job is to confirm the relevant composer/post/message surface is active enough for paste. You may leave elementId empty; the runtime will use the active paste surface. The runtime must paste files from the clipboard and must not click upload buttons that open native pickers.
 - If the user sent a photo, video, or file and says "this", "it", "that photo", "that image", or "that video", treat that as a reference to the attached thread media.
 - Never ignore attached media when the user goal is about posting, uploading, sending, publishing, or sharing the supplied file.
 - Distinguish between operator instruction and publish content. A request like "post this to Facebook" is an automation command, not the caption text of the post.
 - Only type public-facing post text when the user explicitly supplied content to publish.
 - Never invent, derive, paraphrase, summarize, translate, or improvise caption text, post text, message text, hashtags, or emojis.
 - If the user did not explicitly provide public-facing text, keep the composer text empty and publish only the requested media when the platform allows it.
-- Never plan around OS file dialogs, local filesystem browsing, drag-drop mechanics, or manual picker handling.
+- Never plan around OS file dialogs, local filesystem browsing, drag-drop mechanics, upload-button picker flows, or manual picker handling.
 - Gallery/library/media-manager detours are forbidden. Do not open secondary album, gallery, recent-media, cloud-drive, or asset-library surfaces when the current composer already has an obvious attach/upload affordance.
-- If media attachment is required, prefer upload_media on the most local composer/upload target and let the runtime handle the concrete DOM/file mechanics.
+- If media attachment is required and a composer is already active, use upload_media immediately. It does not require a special file-type-specific UI target; the runtime pastes the selected media into the current composer/paste surface.
 
 Total block budget:
 ${stepLimit}
@@ -226,6 +230,9 @@ ${recoveryAttempts}
 Relevant page body text:
 ${observationPacket.bodyText || "<empty>"}
 
+ARIA/accessibility snapshot:
+${observationPacket.ariaSnapshot || "<empty>"}
+
 Retrieved site shortcuts:
 ${formatShortcuts(shortcuts) || "<none>"}
 
@@ -257,18 +264,19 @@ Allowed action types:
 - open_url { "type": "open_url", "url": "https://..." }
 - open_search { "type": "open_search", "query": "...", "engine": "duckduckgo|bing|ya" }
 - insert { "type": "insert", "text": "...", "elementId": "required atlas-... when an input is visible", "submit": false, "submitKey": "optional Enter", "targetReason": "why this element is the right target" }
-- click_element { "type": "click_element", "elementId": "atlas-..." }
+- click_element { "type": "click_element", "elementId": "atlas-..." } OR { "type": "click_element", "targetRole": "button|link|tab|menuitem|checkbox|textbox", "targetName": "exact accessible name from ARIA snapshot" }
 - press_key { "type": "press_key", "key": "Enter" }
 - scroll { "type": "scroll", "deltaY": 320, "note": "optional reason" }
 - read_page { "type": "read_page", "loops": 1 }
-- upload_media { "type": "upload_media", "mediaRef": "first_media|first_image|first_video|all_media|all_images|all_videos|media:<id>", "elementId": "required atlas-... when an upload/attach target is visible", "note": "optional reason", "targetReason": "why this element is the right upload target" }
+- upload_media { "type": "upload_media", "mediaRef": "first_media|first_image|first_video|all_media|all_images|all_videos|media:<id>", "elementId": "optional atlas-... for the current composer/paste surface when obvious", "note": "optional reason", "targetReason": "optional reason" }
 
 Every action must also include:
 - label: short UI label in the same language as the user's latest message, for example "Open Wikipedia" or "Type search query"
 - shortcutKey: optional recipe key when you are intentionally reusing one of the retrieved site shortcuts
 
 Rules:
-- Use elementId actions when the current page already exposes a matching target. For insert, click_element, and upload_media, selecting the concrete target is part of your job as the model.
+- Use elementId actions when the current page already exposes a matching target. For insert, selecting the concrete elementId is part of your job as the model. For upload_media, elementId is optional because the runtime can paste into the active composer/paste surface; include an elementId only when the composer/editor/drop zone is obvious. For click_element, prefer elementId when available; if the target is clearly present in the ARIA/accessibility snapshot but absent from interactive candidates, use targetRole + exact targetName from the ARIA snapshot.
+- If the desired target is present in Relevant interactive elements with an elementId but has inViewport:false or offscreen bounds, still prefer the direct elementId action. The runtime can scroll the target into view during click, insert, or upload; do not spend repeated blocks on scroll+read just to make a known target visible.
 - Session memory has higher priority than shortcuts, weak heuristics, and vague guesses.
 - Retrieved site shortcuts are optional accelerators, not commands. Reuse them only if the current page signals clearly match the shortcut target hints.
 - If a retrieved shortcut looks close but not exact, ignore it and plan from scratch.
@@ -286,26 +294,31 @@ Rules:
 - High-importance failure and avoid entries in session memory are binding. If they include concrete identifiers, do not target the same thing again unless you are explicitly trying a materially different recovery strategy.
 - Treat the execution journal as authoritative thread history. Each journal entry explains what happened, why it mattered, and what the next step should avoid or reuse.
 - Do not ignore prior journal conclusions. If the journal says a step failed, looped, hit the wrong target, or produced no progress, you must change strategy rather than repeating it with superficial wording changes.
+- If a previous element target failed or was blocked by memory, do not return an empty action list just because that same target is unsafe. Choose a materially different recovery action such as read_page, scroll, press_key, or a model-selected navigation route, then verify the resulting state.
+- Never repeat scroll+read_page as a visibility strategy after it has already failed to reveal the same target. If the target is known by elementId, click/insert/upload it directly; if it is unknown, choose a different observation or recovery strategy.
+- After a final Post/Publish/Share click closes the composer, do not spend multiple blocks scrolling the feed to prove the new post exists. If the next task needs comments and no comment target is visible after one verification observation, choose a concrete visible comment target if available; otherwise report that the platform did not expose the published post/comment surface instead of looping.
 - Make every block reliable for the next block. Plan so that the next step can safely build on this one.
 - If the user explicitly provides a URL or asks to open a specific link, use open_url with that exact URL.
 - Use open_search only when the destination is not explicitly given as a direct URL.
 - Never use Google because it often triggers captcha.
 - Prefer DuckDuckGo first, then Bing, then ya.ru when you need a search engine.
 - Prefer search results to reach websites only when you do not already have an explicit URL from the user.
-- If the thread has attached media and the user goal involves posting, uploading, attaching, publishing, or sending files, prefer upload_media as soon as the relevant composer, form, or message surface is open.
+- If the thread has attached media and the user goal involves posting, uploading, attaching, publishing, or sending files, prefer upload_media as soon as the relevant composer, form, message surface, drop zone, or paste surface is open.
+- Do not search for a special PDF/image/video upload element. Clipboard paste works uniformly for supported media; if the composer is open, upload_media can proceed without a special file-type target.
 - If attached media is present and the user goal refers to "this", "it", "photo", "image", "video", "file", or "media", assume the attached thread media is the payload you must operate on.
-- Treat upload_media as a direct runtime attach primitive. Do not plan around OS file pickers, media browsers, local file dialogs, or extra asset-management flows. It is acceptable to target the primary upload/attach control with upload_media when that is the shortest path to attach media.
-- Treat mediaRefs as the only abstraction you need. Do not describe OS filesystems, local paths, buffers, drag-drop internals, or clipboard mechanics.
+- Treat upload_media as a direct runtime clipboard-paste primitive. Do not plan around OS file pickers, media browsers, local file dialogs, upload-button picker flows, or extra asset-management flows. Do not target a visible upload/attach button if clicking it would open a native picker; choose the active composer, drop zone, text box, or paste surface instead.
+- Treat mediaRefs as the only abstraction you need. Do not describe OS filesystems, local paths, buffers, drag-drop internals, or picker mechanics.
 - Prefer first_video when the goal mentions video/reel/clip/story video, first_image when the goal mentions photo/image/picture, and first_media when any attached file is acceptable.
 - Use all_media, all_images, or all_videos only when the page likely supports multiple uploads and the user intent clearly wants multiple files.
 - Prefer insert for entering text. The browser layer already handles humanized typing under the hood.
 - Never paste the raw task instruction into a public composer, caption field, message box, or post body unless the user explicitly asked to publish that exact text.
 - Treat requests like "post this to Facebook", "upload this photo", "send this file", or "publish this image" as control instructions for you, not as end-user content.
 - If a publish composer is ready and media-only posting is possible, prefer leaving the text field empty over inventing or copying task wording into the post.
-- If a publish composer is already open, prefer the nearest in-composer attach/upload affordance. Avoid extra "add media", "gallery", "album", "photo/video", or media-library detours when a local attach target already exists.
+- If a publish composer is already open, prefer its editable composer, drop zone, or paste surface for upload_media. Avoid extra "add media", "gallery", "album", "photo/video", upload picker buttons, or media-library detours.
 - If the composer already shows the uploaded media preview, treat media attachment as complete and continue toward the final publish CTA.
+- If the current page visibly reports that the requested upload/post combination is not allowed, incompatible, failed validation, or needs a changed selection, do not ignore that message. Plan a user-level recovery if one is safe and obvious from the page, otherwise report the blocker with the visible reason.
 - If both a generic page-level upload control and a composer-local attach control are visible, prefer the composer-local target.
-- When in doubt, use upload_media instead of click_element for media attachment steps.
+- When in doubt, use upload_media on the composer/paste surface instead of click_element on media attachment buttons.
 - After clicking a final publish CTA such as Post, Publish, Share, Send, Save, or Done, do not immediately restart the flow.
 - If the execution journal shows a recent final publish click, first verify success on the current page before reopening the composer or re-uploading media.
 - Do not rely on inputHint for target resolution. If a relevant element is visible, emit its concrete elementId and explain the choice in targetReason.
@@ -320,7 +333,7 @@ Rules:
 - If the goal is to send a message in a chat product, choose the editable control that is visibly part of the active conversation/composer, not a navigation or search control.
 - Be aware of the remaining block budget and try to finish within it.
 - Never invent unsupported action names. Only use the allowed action types listed above.
-- Do not invent selectors.
+- Do not invent selectors. For accessibility targets, do not invent names; copy the exact role/name from the ARIA snapshot.
 - Do not skip directly to a final answer if the browser still needs work.
 
 Return JSON only in this exact shape:
@@ -345,7 +358,9 @@ ${userGoal}
 
 You are resolving the concrete browser target for one already-planned action.
 The runtime will not guess from keywords or CSS classes. You must choose a visible
-element id from the observation, or say that no safe target exists.
+element id from the observation. For click_element only, if the target is clearly
+present in the ARIA/accessibility snapshot but absent from interactive candidates,
+you may instead return an exact accessibility target: targetRole + targetName.
 
 Action needing a target:
 ${JSON.stringify(action, null, 2)}
@@ -365,6 +380,9 @@ ${recentMessages.join("\n")}
 Relevant body text:
 ${observationPacket.bodyText || "<empty>"}
 
+ARIA/accessibility snapshot:
+${observationPacket.ariaSnapshot || "<empty>"}
+
 Interactive candidates:
 ${formatInteractive(observationPacket.relevantElements || []) || "<none>"}
 
@@ -376,17 +394,21 @@ ${observationPacket.cleanedHtml || "<empty>"}
 
 Rules:
 - Return an elementId only if it appears in the interactive candidates.
+- For click_element only, if no matching elementId exists but ARIA contains an exact actionable node, return canResolve true with targetRole and targetName copied exactly from that ARIA node.
 - Do not invent selectors, labels, or element ids.
+- Do not invent accessibility names. targetName must be the exact accessible name shown in ARIA.
 - Prefer the element that directly performs the intended action.
 - For insert, choose an editable input/textbox/contenteditable element.
-- For upload_media, choose the nearest visible upload/attach/file control for the current composer/form when possible.
+- For upload_media, choose the nearest visible composer, editable area, drop zone, or paste surface for the current form when one is obvious. If the composer is active but no safe elementId is exposed, set canResolve true without elementId and explain that upload_media should use the active paste surface. Do not choose a control whose purpose is to open a native file picker.
 - For click_element, choose the exact visible control that should be clicked.
 - If no safe target exists, set canResolve to false and explain the missing state.
 
 Return JSON only:
 {
   "canResolve": true,
-  "elementId": "atlas-...",
+  "elementId": "atlas-... or empty for upload_media active paste surface",
+  "targetRole": "button",
+  "targetName": "Exact accessible name, only when elementId is unavailable for click_element",
   "targetReason": "Short reason grounded in visible facts.",
   "confidence": "high|medium|low"
 }
@@ -416,8 +438,8 @@ Agent identity and operating contract:
 - You are analyzing the state of an autonomous AI browser agent.
 - The user's request is the source of truth for what the agent should accomplish.
 - Attached thread media are real assets available to the agent and should be treated as intended payload when the goal refers to the supplied photo, video, image, file, or media.
-- upload_media is the agent's native direct media-injection capability, not a manual OS file workflow.
-- The planner should choose upload_media for attachment steps and let the runtime resolve hidden inputs, labels, buttons, and chooser plumbing.
+- upload_media is the agent's native clipboard-paste media delivery capability, not a manual OS file workflow.
+- The planner should choose upload_media for attachment steps and let the runtime paste files into the current composer/paste surface. Native picker plumbing is forbidden.
 - Operational instructions like "post this to Facebook" are not public-facing caption text and must not be treated as text-to-publish.
 
 Executed actions:
@@ -468,6 +490,9 @@ ${observationPacket.cleanedHtml || "<empty>"}
 Relevant body text:
 ${observationPacket.bodyText || "<empty>"}
 
+ARIA/accessibility snapshot:
+${observationPacket.ariaSnapshot || "<empty>"}
+
 Primary action candidates:
 ${formatPrimaryActions(observationPacket.relevantElements || []) || "<none>"}
 
@@ -481,9 +506,10 @@ Be strict about semantic mismatches:
 - If the agent pasted the task instruction or operator command into a public composer or post body, call that out explicitly as a semantic failure.
 - If attached media existed but the block ignored that media during a posting/upload task, call that out explicitly.
 - If the agent opened secondary add-media flows, galleries, libraries, or redundant attachment surfaces even though the active composer already had a usable local upload target or already showed attached media, call that out explicitly.
-- If the agent used click_element on an upload-related control where upload_media should have been used, call that out explicitly as a planning mistake.
+- If the agent used click_element on an upload-related control where upload_media clipboard-paste should have been used, call that out explicitly as a planning mistake.
 - If attached media is already visible in the composer preview, treat the upload step as complete rather than asking for another media-selection step.
 - If a final publish CTA was clicked and the composer or dialog then closed, treat that as likely success unless the page shows an explicit error, validation failure, failed upload state, or still-visible unfinished composer.
+- If the page shows a visible validation, incompatibility, upload failure, disabled-submit reason, or "cannot combine" style message after attaching media or submitting, treat that page message as authoritative evidence. Do not mark the step successful merely because an upload_media or click action mechanically completed.
 - Returning to the feed/profile/main page after a final publish click is not by itself a failure signal.
 - Do not conclude that uploaded media was lost just because the composer disappeared after a final publish click.
 - If publish completion is uncertain after a final CTA click, set needsVisualFallback to true instead of assuming failure and restarting the flow.
@@ -574,8 +600,8 @@ Agent identity and operating contract:
 - You are analyzing a screenshot for an autonomous AI browser agent.
 - The user's request is the source of truth for what the agent should accomplish.
 - Attached thread media are real assets available to the agent and should be treated as intended payload when the goal refers to the supplied photo, video, image, file, or media.
-- upload_media is the agent's native direct media-injection capability, not a manual OS file workflow.
-- The planner should use upload_media for attachment steps and let the runtime resolve the underlying page mechanism.
+- upload_media is the agent's native clipboard-paste media delivery capability, not a manual OS file workflow.
+- The planner should use upload_media for attachment steps and let the runtime paste files into the current page surface.
 - Operational instructions like "post this to Facebook" are not public-facing caption text and must not be treated as text-to-publish.
 
 Executed actions:
@@ -672,7 +698,7 @@ The agent is fully autonomous and must never ask the user for more input during 
 You are a real AI browser agent with access to page state, thread history, and attached media through upload_media.
 The user's request is the source of truth for the task.
 Task instructions are not automatically public-facing content.
-upload_media is a native direct media attach capability and should be planned as a short in-page attach step, not as a long detour through picker-style UI.
+upload_media is a native clipboard-paste media attach capability and should be planned as a short in-page paste step, not as a long detour through picker-style UI.
 Use upload_media for media attachment instead of click_element whenever possible.
 Never invent publish text. Never plan manual picker-style flows, gallery surfaces, asset-library detours, or native file dialogs.
 `.trim();
@@ -686,7 +712,7 @@ Always write user-facing text fields in the same language as the user's latest m
 The agent is fully autonomous and must never ask the user for more input during task execution.
 The user's request is the source of truth for the task.
 Task instructions are not automatically public-facing content.
-upload_media is a native direct media attach capability and should not be analyzed as if the agent needed to manually browse OS files.
+upload_media is a native clipboard-paste media attach capability and should not be analyzed as if the agent needed to manually browse OS files.
 Treat any manual picker-style upload flow, gallery/library detour, or invented publish text as a planning failure.
 `.trim();
 

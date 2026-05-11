@@ -109,6 +109,50 @@ function describeMessageMedia(message) {
     .join(", ");
 }
 
+function buildPlanningFailureReport({
+  language,
+  plan,
+  planResult,
+  observation,
+  stepMode,
+  priorAnalysis,
+  lastError,
+  recoveryAttempts,
+  retrievedShortcuts,
+}) {
+  const page = observation?.page || {};
+  const candidateCount = Array.isArray(observation?.interactive) ? observation.interactive.length : 0;
+  const plannerComment = String(plan?.comment || "").trim();
+  const plannerGoal = String(plan?.blockGoal || "").trim();
+  const priorReason = String(priorAnalysis?.failureReason || priorAnalysis?.outcomeReason || "").trim();
+  const nextFocus = String(priorAnalysis?.nextFocus || "").trim();
+  const details = [
+    `page: ${page.title || "Untitled"} (${page.url || "unknown URL"})`,
+    `mode: ${stepMode || "unknown"} / ${planResult?.contextLevel || "unknown"} / ${planResult?.retryMode || "unknown"}`,
+    `visible candidates collected: ${candidateCount}`,
+    `recovery attempts used: ${recoveryAttempts}`,
+    `shortcuts offered: ${Array.isArray(retrievedShortcuts) ? retrievedShortcuts.length : 0}`,
+    plannerComment ? `planner comment: ${plannerComment}` : "",
+    plannerGoal ? `planner goal: ${plannerGoal}` : "",
+    lastError ? `latest execution error: ${lastError}` : "",
+    priorReason ? `previous analysis reason: ${priorReason}` : "",
+    nextFocus ? `previous next focus: ${nextFocus}` : "",
+  ].filter(Boolean);
+
+  const heading = localize(
+    language,
+    "Planner stopped because it returned no executable browser actions.",
+    "Планировщик остановился, потому что вернул ноль исполнимых браузерных действий.",
+  );
+  const guidance = localize(
+    language,
+    "This usually means the current observation did not expose a safe target, or the previous error made the planner avoid repeating the same target.",
+    "Обычно это значит, что текущее наблюдение не дало безопасной цели, либо предыдущая ошибка заставила планировщик не повторять тот же target.",
+  );
+
+  return `${heading}\n${guidance}\n\n${details.join("\n")}`;
+}
+
 function recentThreadMessages(thread) {
   return thread.messages.slice(-6).map((message) => {
     const media = describeMessageMedia(message);
@@ -426,6 +470,7 @@ function inferSessionMemoryWrites(analysis, observation, userGoal, executedActio
   const latestIdentifiers = collectActionIdentifiers(latestAction, observation);
   const outcomeStatus = String(analysis?.outcomeStatus || "").trim().toLowerCase();
   const outcomeReason = String(analysis?.outcomeReason || analysis?.failureReason || analysis?.progressSummary || "").trim();
+  const cannotContinue = Boolean(analysis?.cannotContinue);
 
   if (blockError) {
     writes.push({
@@ -439,7 +484,7 @@ function inferSessionMemoryWrites(analysis, observation, userGoal, executedActio
     });
   }
 
-  if (!blockError && ["bad", "failure", "dead_end"].includes(outcomeStatus)) {
+  if (!blockError && ["bad", "failure", "dead_end"].includes(outcomeStatus) && cannotContinue) {
     writes.push({
       key: `avoid:${latestAction?.type || "block"}`,
       kind: "avoid",
@@ -540,8 +585,9 @@ function inferThreadMemoryFromAnalysis(analysis, observation, executedActions, b
     .trim()
     .toLowerCase();
   const outcomeReason = String(analysis?.outcomeReason || analysis?.sourceReason || analysis?.progressSummary || "").trim();
+  const cannotContinue = Boolean(analysis?.cannotContinue);
 
-  if (outcomeStatus === "bad") {
+  if (outcomeStatus === "bad" && cannotContinue) {
     additions.push({
       kind: "avoid",
       action: latestAction?.type || "",
@@ -638,6 +684,15 @@ function actionElementId(action) {
   return String(action?.elementId || "").trim();
 }
 
+function actionAccessibleTarget(action) {
+  const role = compactText(action?.targetRole || action?.accessibilityRole || action?.role);
+  const name = String(action?.targetName || action?.accessibilityName || action?.name || "").trim();
+  if (!role || !name) {
+    return null;
+  }
+  return { role, name };
+}
+
 function targetModeForAction(action) {
   const type = compactText(action?.type);
 
@@ -656,11 +711,24 @@ function targetModeForAction(action) {
   return "generic";
 }
 
-function actionNeedsModelTarget(action) {
+function actionNeedsModelTarget(action, observation = null) {
   const type = compactText(action?.type);
 
   if (["insert", "upload_media", "click_element", "type_element"].includes(type)) {
-    return !actionElementId(action);
+    if (type === "upload_media") {
+      return false;
+    }
+    const elementId = actionElementId(action);
+    if (type === "click_element" && actionAccessibleTarget(action)) {
+      return false;
+    }
+    if (!elementId) {
+      return true;
+    }
+    if (!observation || !Array.isArray(observation.interactive)) {
+      return false;
+    }
+    return !observation.interactive.some((element) => String(element?.id || "").trim() === elementId);
   }
 
   return type === "click_by_text";
@@ -669,9 +737,11 @@ function actionNeedsModelTarget(action) {
 function applyResolvedTarget(action, resolution) {
   const elementId = String(resolution?.elementId || "").trim();
   const targetReason = String(resolution?.targetReason || "").trim();
+  const targetRole = compactText(resolution?.targetRole || resolution?.accessibilityRole || resolution?.role);
+  const targetName = String(resolution?.targetName || resolution?.accessibilityName || resolution?.name || "").trim();
   const type = compactText(action?.type);
 
-  if (!elementId) {
+  if (!elementId && !(type === "click_element" && targetRole && targetName)) {
     return action;
   }
 
@@ -689,6 +759,7 @@ function applyResolvedTarget(action, resolution) {
     ...action,
     elementId,
     targetReason,
+    ...(targetRole && targetName ? { targetRole, targetName } : {}),
   };
 }
 
@@ -732,8 +803,24 @@ function shouldAvoidShortcut(shortcut, threadMemory, sessionMemory) {
   });
 }
 
-function shouldAvoidAction(action, threadMemory, sessionMemory) {
+function priorAnalysisAllowsRetry(priorAnalysis) {
+  if (!priorAnalysis || priorAnalysis.cannotContinue !== false) {
+    return false;
+  }
+
+  const status = compactText(priorAnalysis.outcomeStatus || priorAnalysis.sourceStatus);
+  const nextFocus = compactText(priorAnalysis.nextFocus);
+  const failureReason = compactText(priorAnalysis.failureReason);
+
+  return Boolean(nextFocus && !failureReason && ["bad", "partial", "unclear"].includes(status));
+}
+
+function shouldAvoidAction(action, threadMemory, sessionMemory, planningContext = {}) {
   const actionType = compactText(action?.type);
+  if (actionType === "click_element" && priorAnalysisAllowsRetry(planningContext.priorAnalysis)) {
+    return false;
+  }
+
   const haystack = [
     action?.url,
     action?.text,
@@ -765,6 +852,57 @@ function shouldAvoidAction(action, threadMemory, sessionMemory) {
       hasStrongIdentifierOverlap(entry, action)
     );
   });
+}
+
+function actionTypes(actions) {
+  return (actions || []).map((action) => compactText(action?.type)).filter(Boolean);
+}
+
+function isOnlyScrollRead(actions) {
+  const types = actionTypes(actions);
+  return Boolean(types.length && types.every((type) => type === "scroll" || type === "read_page"));
+}
+
+function journalEntryMentionsScrollRead(entry) {
+  const summary = compactText(
+    [
+      entry?.actionSummary,
+      entry?.outcome,
+      entry?.why,
+      entry?.nextGuidance,
+    ].join(" "),
+  );
+  return summary.includes("scroll") && summary.includes("read_page");
+}
+
+function recentScrollReadLoopCount(executionJournal) {
+  let count = 0;
+  const entries = Array.isArray(executionJournal) ? [...executionJournal].reverse() : [];
+  for (const entry of entries.slice(0, 6)) {
+    if (!journalEntryMentionsScrollRead(entry)) {
+      break;
+    }
+    count += 1;
+  }
+  return count;
+}
+
+function shouldBlockScrollReadLoop(actions, executionJournal, priorAnalysis) {
+  if (!isOnlyScrollRead(actions)) {
+    return false;
+  }
+  if (recentScrollReadLoopCount(executionJournal) >= 2) {
+    return true;
+  }
+  const nextFocus = compactText(priorAnalysis?.nextFocus);
+  const outcomeReason = compactText(priorAnalysis?.outcomeReason || priorAnalysis?.failureReason);
+  return (
+    recentScrollReadLoopCount(executionJournal) >= 1 &&
+    (nextFocus.includes("not visible") ||
+      nextFocus.includes("не вид") ||
+      outcomeReason.includes("not visible") ||
+      outcomeReason.includes("не вид"))
+  );
 }
 
 function detectShortcutMismatch({
@@ -894,7 +1032,7 @@ async function resolveActionTargetWithModel({
   lastError,
   logger,
 }) {
-  if (!actionNeedsModelTarget(action)) {
+  if (!actionNeedsModelTarget(action, observation)) {
     return action;
   }
 
@@ -915,11 +1053,17 @@ async function resolveActionTargetWithModel({
   });
   const resolution = result.data || {};
   const resolvedElementId = String(resolution.elementId || "").trim();
+  const resolvedTargetRole = compactText(
+    resolution.targetRole || resolution.accessibilityRole || resolution.role,
+  );
+  const resolvedTargetName = String(
+    resolution.targetName || resolution.accessibilityName || resolution.name || "",
+  ).trim();
   const candidateIds = new Set(
     (packet.relevantElements || []).map((element) => String(element?.id || "").trim()).filter(Boolean),
   );
 
-  if (!resolution.canResolve || !resolvedElementId) {
+  if (!resolution.canResolve || (!resolvedElementId && !(resolvedTargetRole && resolvedTargetName))) {
     const error = new Error(
       String(resolution.targetReason || "").trim() ||
         `The model could not resolve a target for ${action?.type || "action"}.`,
@@ -931,7 +1075,7 @@ async function resolveActionTargetWithModel({
     throw error;
   }
 
-  if (!candidateIds.has(resolvedElementId)) {
+  if (resolvedElementId && !candidateIds.has(resolvedElementId) && !(resolvedTargetRole && resolvedTargetName)) {
     const error = new Error(`The model returned elementId "${resolvedElementId}", but it was not in the target candidates.`);
     error.name = "TargetResolutionError";
     error.code = "TARGET_NOT_IN_CANDIDATES";
@@ -940,11 +1084,17 @@ async function resolveActionTargetWithModel({
     throw error;
   }
 
-  const resolved = applyResolvedTarget(action, resolution);
+  const safeResolution = {
+    ...resolution,
+    elementId: resolvedElementId && candidateIds.has(resolvedElementId) ? resolvedElementId : "",
+  };
+  const resolved = applyResolvedTarget(action, safeResolution);
   logger.event("agent.service", "action_target_model_resolved", {
     originalType: action?.type || "",
     resolvedType: resolved?.type || "",
     elementId: resolved.elementId || "",
+    targetRole: resolved.targetRole || "",
+    targetName: resolved.targetName || "",
     targetReason: resolved.targetReason || "",
     confidence: resolution.confidence || "",
   });
@@ -1121,13 +1271,13 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
     throw new Error(buildGemini503StopMessage(task));
   }
 
-  async function observe(threadId, runtime, activeLogger = logger) {
+  async function observe(threadId, runtime, activeLogger = logger, options = {}) {
     const observation = await captureObservation({
       canvas: runtime.canvas,
       threadId,
       rootDir: path.join(process.cwd(), "logs"),
       logger: activeLogger,
-      captureScreenshot: false,
+      captureScreenshot: Boolean(options.captureScreenshot),
     });
     runtime.lastObservation = observation;
     store.updateMeta(threadId, {
@@ -1214,7 +1364,7 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
         key: "thread_media_capability",
         kind: "constraint",
         value:
-          "Attached thread media are real assets available for upload. upload_media is a native direct attach capability. If the goal refers to this photo, this image, this video, this file, or this media, use the attached media as the payload.",
+          "Attached thread media are real assets available for upload. upload_media is a native clipboard-paste file delivery capability. If the goal refers to this photo, this image, this video, this file, or this media, use the attached media as the payload.",
         reason: "The agent should understand and trust its own media-handling capability.",
         importance: "high",
         replace: true,
@@ -1232,7 +1382,7 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
         key: "picker_ban_policy",
         kind: "constraint",
         value:
-          "Manual picker handling is forbidden. Never plan around OS file dialogs, filesystem browsing, gallery/library/media-manager detours, or extra asset surfaces. For attachment steps, use upload_media on the most relevant current-page attach/upload target and let the runtime handle hidden inputs, labels, buttons, and chooser mechanics.",
+          "Manual picker handling is forbidden. Never plan around OS file dialogs, filesystem browsing, gallery/library/media-manager detours, upload-button picker flows, or extra asset surfaces. For attachment steps, use upload_media when the relevant composer/post/message surface is active; elementId is optional because runtime delivery is clipboard paste only.",
         reason: "The agent must avoid hanging in manual picker flows while still trusting the runtime uploader.",
         importance: "high",
         replace: true,
@@ -1241,7 +1391,7 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
         key: "upload_flow_short_path",
         kind: "constraint",
         value:
-          "During publish flows, prefer the shortest in-composer media attach path. Use upload_media as soon as the relevant composer or form is open. Do not open redundant gallery, add-media, album, or library surfaces when a usable local upload target already exists or when attached media is already visible in the composer.",
+          "During publish flows, prefer the shortest in-composer media paste path. Use upload_media as soon as the relevant composer/post/message surface is open; do not search for file-type-specific PDF/image/video upload places. Do not open redundant gallery, add-media, album, upload-button picker, or library surfaces when a usable paste surface already exists or when attached media is already visible in the composer.",
         reason: "Planner should avoid unnecessary upload detours and proceed toward final publish once media is attached.",
         importance: "high",
         replace: true,
@@ -1339,7 +1489,51 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
           ),
         }));
 
-        if (actions.some((action) => shouldAvoidAction(action, threadMemory, sessionMemory))) {
+        if (shouldBlockScrollReadLoop(actions, executionJournal, priorAnalysis)) {
+          runLogger.warn("agent.service", "scroll_read_loop_blocked", {
+            threadId,
+            cycle,
+            actions,
+            recentScrollReadLoopCount: recentScrollReadLoopCount(executionJournal),
+            priorAnalysis,
+          });
+          lastError =
+            "Repeated scroll+read_page did not make progress. Do not keep scrolling to search for the same thing; choose a concrete visible target, a non-scroll recovery action, or report the blocker.";
+          const scrollLoopRetry = await planWithRetry({
+            threadId,
+            requestGemini: (targetThreadId, request) => requestGemini(targetThreadId, request, runLogger),
+            observation,
+            userGoal,
+            recentMessages,
+            priorAnalysis,
+            previousBlocks,
+            lastError,
+            recoveryAttempts: runtime.recoveryAttempts,
+            stepLimit,
+            currentCycle: cycle,
+            stepMode,
+            shortcuts: [],
+            threadMemory,
+            sessionMemory,
+            executionJournal,
+            mediaAttachments,
+          });
+          planResult = scrollLoopRetry;
+          plan = scrollLoopRetry.plan || plan;
+          planUsage = mergeUsage(planUsage, scrollLoopRetry.planUsage || emptyUsage());
+          actions = (Array.isArray(plan.actions) ? plan.actions.slice(0, 3) : [])
+            .map((action) => ({
+              ...action,
+              shortcutKey: "",
+            }));
+          if (shouldBlockScrollReadLoop(actions, executionJournal, priorAnalysis)) {
+            actions = [];
+            lastError =
+              "Planner repeated scroll+read_page after repeated no-progress scroll attempts. Stopping instead of looping.";
+          }
+        }
+
+        if (actions.some((action) => shouldAvoidAction(action, threadMemory, sessionMemory, { priorAnalysis }))) {
           runLogger.warn("agent.service", "thread_memory_plan_blocked", {
             threadId,
             cycle,
@@ -1381,7 +1575,40 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
                 cycle,
               ),
             }))
-            .filter((action) => !shouldAvoidAction(action, threadMemory, sessionMemory));
+            .filter((action) => !shouldAvoidAction(action, threadMemory, sessionMemory, { priorAnalysis }));
+
+          if (!actions.length) {
+            lastError =
+              "The previous retry repeated blocked targets. Choose a materially different recovery action; do not return an empty plan unless no browser recovery is possible.";
+            const recoveryRetry = await planWithRetry({
+              threadId,
+              requestGemini: (targetThreadId, request) => requestGemini(targetThreadId, request, runLogger),
+              observation,
+              userGoal,
+              recentMessages,
+              priorAnalysis,
+              previousBlocks,
+              lastError,
+              recoveryAttempts: runtime.recoveryAttempts,
+              stepLimit,
+              currentCycle: cycle,
+              stepMode,
+              shortcuts: [],
+              threadMemory,
+              sessionMemory,
+              executionJournal,
+              mediaAttachments,
+            });
+            planResult = recoveryRetry;
+            plan = recoveryRetry.plan || plan;
+            planUsage = mergeUsage(planUsage, recoveryRetry.planUsage || emptyUsage());
+            actions = (Array.isArray(plan.actions) ? plan.actions.slice(0, 3) : [])
+              .map((action) => ({
+                ...action,
+                shortcutKey: "",
+              }))
+              .filter((action) => !shouldAvoidAction(action, threadMemory, sessionMemory, { priorAnalysis }));
+          }
         }
 
         runLogger.event("agent.service", "block_planned", {
@@ -1395,17 +1622,39 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
         });
 
         if (!actions.length) {
+          const failureReport = buildPlanningFailureReport({
+            language: responseLanguage,
+            plan,
+            planResult,
+            observation,
+            stepMode,
+            priorAnalysis,
+            lastError,
+            recoveryAttempts: runtime.recoveryAttempts,
+            retrievedShortcuts,
+          });
+          store.updateMeta(threadId, {
+            lastRunError: failureReport,
+          });
           addAssistantMessage(
             threadId,
             "error",
-            localize(
-              responseLanguage,
-              "I could not build a safe action block, so I am stopping here.",
-              "Я не смог собрать безопасный блок действий, поэтому останавливаюсь здесь.",
-            ),
+            failureReport,
             {
               cycle,
               phase: "plan",
+              plan,
+              planningMode: stepMode,
+              plannerContextLevel: planResult.contextLevel,
+              plannerRetryMode: planResult.retryMode,
+              observationSummary: {
+                page: observation.page,
+                interactiveCount: Array.isArray(observation.interactive) ? observation.interactive.length : 0,
+                pageSemantics: observation.pageSemantics || {},
+              },
+              priorAnalysis,
+              lastError,
+              recoveryAttempts: runtime.recoveryAttempts,
             },
           );
           break;
@@ -1523,24 +1772,33 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
         let visualUsage = emptyUsage();
 
         if (analysis.needsVisualFallback) {
-          const visualResult = await requestGemini(threadId, {
-            task: "analyze_visual_fallback",
-            systemInstruction: ANALYZER_SYSTEM,
-            prompt: buildVisualAnalyzerPrompt({
-              userGoal,
-              executedActions: actionResults,
-              recentMessages: recentThreadMessages(store.getThread(threadId)),
-              blockError,
-              usedShortcuts,
-              threadMemory,
-              sessionMemory,
-              executionJournal,
-              mediaAttachments,
-            }),
-            imagePath: analyzedObservation.screenshotPath,
-          }, runLogger);
-          analysis = visualResult.data;
-          visualUsage = visualResult.usage || emptyUsage();
+          const visualObservation = analyzedObservation.screenshotPath
+            ? analyzedObservation
+            : await observe(threadId, runtime, runLogger, { captureScreenshot: true });
+          if (visualObservation.screenshotPath) {
+            const visualResult = await requestGemini(threadId, {
+              task: "analyze_visual_fallback",
+              systemInstruction: ANALYZER_SYSTEM,
+              prompt: buildVisualAnalyzerPrompt({
+                userGoal,
+                executedActions: actionResults,
+                recentMessages: recentThreadMessages(store.getThread(threadId)),
+                blockError,
+                usedShortcuts,
+                threadMemory,
+                sessionMemory,
+                executionJournal,
+                mediaAttachments,
+              }),
+              imagePath: visualObservation.screenshotPath,
+            }, runLogger);
+            analysis = visualResult.data;
+            visualUsage = visualResult.usage || emptyUsage();
+          } else {
+            runLogger.warn("agent.service", "visual_fallback_skipped_no_screenshot", {
+              threadId,
+            });
+          }
         }
 
         const usedShortcutKeys = actions
@@ -1729,19 +1987,31 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
           lastError = blockError;
 
           if (runtime.recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
-            addAssistantMessage(
-              threadId,
-              "error",
+            const recoveryReport = [
               analysis.failureReason ||
                 localize(
                   responseLanguage,
-                  "I tried to recover twice after the failure and still could not continue safely.",
-                  "Я дважды попытался восстановиться после ошибки, но всё ещё не могу безопасно продолжать.",
+                  "Recovery limit reached after repeated failures.",
+                  "Достигнут лимит восстановления после повторных ошибок.",
                 ),
+              "",
+              blockError ? `execution error: ${blockError}` : "",
+              analysis.outcomeReason ? `analysis reason: ${analysis.outcomeReason}` : "",
+              analysis.nextFocus ? `next focus was: ${analysis.nextFocus}` : "",
+            ].filter(Boolean).join("\n");
+            store.updateMeta(threadId, {
+              lastRunError: recoveryReport,
+            });
+            addAssistantMessage(
+              threadId,
+              "error",
+              recoveryReport,
               {
                 cycle,
                 phase: "recovery_failed",
                 attemptsUsed: runtime.recoveryAttempts,
+                blockError,
+                analysis,
               },
             );
             break;

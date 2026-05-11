@@ -52,6 +52,7 @@ function scoreClickCandidate(element) {
   if (section === "dialog") score += 18;
   if (section === "composer") score += 16;
   if (section === "main") score += 6;
+  if (section === "navigation") score += 4;
   if (purpose === "button") score += 12;
   if (purpose === "link") score += 8;
   if (labelSource) score += 5;
@@ -107,7 +108,7 @@ function scoreSearchCandidate(element) {
 
 function selectCandidates(interactive, mode, expanded) {
   const source = Array.isArray(interactive) ? interactive : [];
-  const maxItems = expanded ? 18 : 10;
+  const maxItems = expanded ? 32 : 16;
   let fields = [
     "id",
     "tag",
@@ -117,6 +118,8 @@ function selectCandidates(interactive, mode, expanded) {
     "visibleName",
     "descriptor",
     "disabled",
+    "bounds",
+    "inViewport",
   ];
   let scorer = scoreClickCandidate;
 
@@ -135,6 +138,8 @@ function selectCandidates(interactive, mode, expanded) {
       "label",
       "nearbyText",
       "descriptor",
+      "bounds",
+      "inViewport",
     ];
     scorer = scoreInputCandidate;
   } else if (mode === "navigation") {
@@ -149,6 +154,8 @@ function selectCandidates(interactive, mode, expanded) {
       "label",
       "descriptor",
       "disabled",
+      "bounds",
+      "inViewport",
     ];
     scorer = scoreNavigationCandidate;
   } else if (mode === "search") {
@@ -167,6 +174,8 @@ function selectCandidates(interactive, mode, expanded) {
       "href",
       "descriptor",
       "disabled",
+      "bounds",
+      "inViewport",
     ];
     scorer = scoreSearchCandidate;
   } else if (mode === "upload") {
@@ -185,6 +194,8 @@ function selectCandidates(interactive, mode, expanded) {
       "nearbyText",
       "text",
       "descriptor",
+      "bounds",
+      "inViewport",
     ];
     scorer = rankUploadCandidate;
   } else if (mode === "generic") {
@@ -204,6 +215,8 @@ function selectCandidates(interactive, mode, expanded) {
       "text",
       "href",
       "descriptor",
+      "bounds",
+      "inViewport",
     ];
     scorer = (element) =>
       Math.max(
@@ -243,8 +256,10 @@ function buildObservationPacket(observation, { mode, expanded }) {
 
   const bodyLimit = expanded ? 1800 : 700;
   const htmlLimit = expanded ? 2200 : 0;
+  const ariaLimit = expanded ? 2600 : 1200;
   const bodyText = String(observation.bodyText || "").trim().slice(0, bodyLimit);
   const cleanedHtml = String(observation.cleanedHtml || "").trim().slice(0, htmlLimit);
+  const ariaSnapshot = String(observation.ariaSnapshot || "").trim().slice(0, ariaLimit);
 
   if (bodyText) {
     packet.bodyText = bodyText;
@@ -252,6 +267,10 @@ function buildObservationPacket(observation, { mode, expanded }) {
 
   if (cleanedHtml) {
     packet.cleanedHtml = cleanedHtml;
+  }
+
+  if (ariaSnapshot) {
+    packet.ariaSnapshot = ariaSnapshot;
   }
 
   return packet;

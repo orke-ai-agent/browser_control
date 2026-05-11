@@ -35,6 +35,8 @@ Do not add new agent decision logic based on:
 - weighted scoring systems that infer what the user wants from words or CSS class names
 - language-specific synonym lists in executor/runtime code
 - site-specific semantic guesses in generic runtime modules
+- site-specific runtime fallbacks for known products, routes, selectors, shortcuts,
+  or workflows in generic browser-agent code
 - fallback selectors invented from visible text when the model did not select a target
 
 Forbidden examples:
@@ -54,6 +56,16 @@ if (haystack.includes("upload") || haystack.includes("attach")) {
 ```js
 const family = /post|send|publish|отправ/.test(nextFocus) ? "click" : "generic";
 ```
+
+```js
+if (hostname.includes("mail.google.com") && goal.includes("compose")) {
+  await page.goto("https://mail.google.com/mail/u/0/#compose");
+}
+```
+
+Site/product-specific routes and shortcuts are allowed only when the model selects
+them as an action from task context and observations. They must not be hidden in
+runtime code as automatic fallbacks.
 
 ## Allowed Low-Level Uses
 
