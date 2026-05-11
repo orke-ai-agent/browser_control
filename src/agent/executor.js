@@ -26,6 +26,74 @@ function actionElementId(action) {
   return String(action?.elementId || "").trim();
 }
 
+function actionNodeId(action) {
+  return String(action?.nodeId || "").trim();
+}
+
+function graphNodeById(pageGraph, nodeId) {
+  const targetId = String(nodeId || "").trim();
+  if (!targetId || !pageGraph) {
+    return null;
+  }
+  const buckets = [
+    pageGraph.interactive,
+    pageGraph.forms,
+    pageGraph.dialogs,
+    pageGraph.landmarks,
+    pageGraph.validationMessages,
+    pageGraph.media,
+    pageGraph.frames,
+    pageGraph.textBlocks,
+    pageGraph.activeElement ? [pageGraph.activeElement] : [],
+  ];
+  for (const bucket of buckets) {
+    for (const node of bucket || []) {
+      if (String(node?.nodeId || "").trim() === targetId) {
+        return node;
+      }
+    }
+  }
+  return null;
+}
+
+function nodeTargetError(code, message, action, nodeId, details = {}) {
+  const error = new Error(message);
+  error.name = "NodeTargetResolutionError";
+  error.code = code;
+  error.action = action;
+  error.nodeId = nodeId;
+  error.details = details;
+  return error;
+}
+
+function resolveNodeAction(action, observation) {
+  const nodeId = actionNodeId(action);
+  if (!nodeId || actionElementId(action)) {
+    return action;
+  }
+
+  const node = graphNodeById(observation?.pageGraph, nodeId);
+  if (!node) {
+    throw nodeTargetError("NODE_STALE", `AgentPageGraph node "${nodeId}" is no longer present.`, action, nodeId);
+  }
+  if (node.disabled) {
+    throw nodeTargetError("NODE_DISABLED", `AgentPageGraph node "${nodeId}" is disabled.`, action, nodeId);
+  }
+  if (node.visible === false) {
+    throw nodeTargetError("NODE_NOT_VISIBLE", `AgentPageGraph node "${nodeId}" is not visible.`, action, nodeId);
+  }
+  if (!node.atlasId) {
+    throw nodeTargetError("NODE_NOT_EXECUTABLE", `AgentPageGraph node "${nodeId}" has no executable atlas target.`, action, nodeId);
+  }
+
+  return {
+    ...action,
+    elementId: node.atlasId,
+    resolvedNodeId: nodeId,
+    targetReason: action.targetReason || `Resolved AgentPageGraph node ${nodeId}`,
+  };
+}
+
 function actionAccessibleTarget(action) {
   const role = compact(action?.targetRole || action?.accessibilityRole || action?.role);
   const name = textValue(action?.targetName || action?.accessibilityName || action?.name);
@@ -811,6 +879,7 @@ async function uploadViaRuntime({ canvas, logger, resolvedElement, elementId, fi
 }
 
 async function executeAction({ action, canvas, observation, logger }) {
+  action = resolveNodeAction(action, observation);
   logger.event("agent.executor", "action_start", { action });
 
   switch (action.type) {
@@ -884,10 +953,11 @@ async function executeAction({ action, canvas, observation, logger }) {
         await canvas.settle();
       }
       return {
-        resolvedTarget: {
-          kind: "element",
-          elementId,
-          purpose: resolvedElement?.purpose || "",
+          resolvedTarget: {
+            kind: "element",
+            elementId,
+            nodeId: action.resolvedNodeId || action.nodeId || "",
+            purpose: resolvedElement?.purpose || "",
           section: resolvedElement?.section || "",
           descriptor: resolvedElement?.descriptor || "",
           className: resolvedElement?.className || "",
@@ -913,10 +983,11 @@ async function executeAction({ action, canvas, observation, logger }) {
         await canvas.settle();
       }
       return {
-        resolvedTarget: {
-          kind: "element",
-          elementId: action.elementId,
-        },
+          resolvedTarget: {
+            kind: "element",
+            elementId: action.elementId,
+            nodeId: action.resolvedNodeId || action.nodeId || "",
+          },
       };
     }
 
@@ -945,6 +1016,7 @@ async function executeAction({ action, canvas, observation, logger }) {
           resolvedTarget: {
             kind: "element",
             elementId,
+            nodeId: action.resolvedNodeId || action.nodeId || "",
             clickFallback: accessibleClick,
             role: accessibleClick.role,
             visibleName: accessibleClick.name,
@@ -989,10 +1061,11 @@ async function executeAction({ action, canvas, observation, logger }) {
 
       await canvas.settle();
       return {
-        resolvedTarget: {
-          kind: "element",
-          elementId,
-          clickFallback,
+          resolvedTarget: {
+            kind: "element",
+            elementId,
+            nodeId: action.resolvedNodeId || action.nodeId || "",
+            clickFallback,
           role: resolvedElement?.role || "",
           tag: resolvedElement?.tag || "",
           purpose: resolvedElement?.purpose || "",
@@ -1113,6 +1186,7 @@ async function executeAction({ action, canvas, observation, logger }) {
         resolvedTarget: {
           kind: "media_upload",
           elementId,
+          nodeId: action.resolvedNodeId || action.nodeId || "",
           uploadMethod: uploadResult.method,
           uploadAtlasId: uploadResult.atlasId || "",
           mediaRef: action.mediaRef || "first_media",

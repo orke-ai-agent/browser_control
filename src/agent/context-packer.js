@@ -2,6 +2,7 @@ const {
   compact,
   inferFlowProfile,
 } = require("./semantic");
+const { buildGraphPromptView } = require("./observation/prompt-view");
 
 function pickFields(element, fields) {
   const payload = {};
@@ -238,6 +239,46 @@ function selectCandidates(interactive, mode, expanded) {
 }
 
 function buildObservationPacket(observation, { mode, expanded }) {
+  if (observation?.pageGraph) {
+    const graph = observation.pageGraph;
+    const view = buildGraphPromptView(graph, { mode, expanded });
+    const page = {
+      url: graph.page?.url || observation.page?.url || "",
+      title: graph.page?.title || observation.page?.title || "",
+    };
+    const textOutline = view.promptGraph.textOutline || [];
+    const bodyText = textOutline
+      .map((item) => item.text)
+      .filter(Boolean)
+      .join("\n")
+      .slice(0, expanded ? 2200 : 900);
+
+    return {
+      mode,
+      contextLevel: expanded ? "expanded_graph" : "compact_graph",
+      page,
+      pageSemantics: {
+        ...(observation.pageSemantics || {}),
+        viewport: graph.page?.viewport || observation.pageSemantics?.viewport || null,
+        scroll: graph.page?.scroll || null,
+        modality: graph.modality || {},
+        activeElement: view.promptGraph.activeElement || null,
+      },
+      flow: {
+        host: hostFromUrl(page.url),
+        modality: graph.modality?.kind || "unknown",
+        domQuality: graph.modality?.domQuality || "unknown",
+        ariaQuality: graph.modality?.ariaQuality || "unknown",
+        visualNeeded: Boolean(graph.modality?.visualNeeded),
+      },
+      pageGraph: view.promptGraph,
+      relevantElements: view.executableElements,
+      bodyText,
+      ariaSnapshot: view.ariaSnapshot,
+      cleanedHtml: "",
+    };
+  }
+
   const profile = inferFlowProfile(observation);
   const packet = {
     mode,
@@ -274,6 +315,14 @@ function buildObservationPacket(observation, { mode, expanded }) {
   }
 
   return packet;
+}
+
+function hostFromUrl(url) {
+  try {
+    return new URL(String(url || "")).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
 }
 
 module.exports = {

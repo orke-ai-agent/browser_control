@@ -2,6 +2,8 @@ const path = require("path");
 const { createAtlasSession } = require("../atlas");
 const { createGeminiClient } = require("./gemini");
 const { captureObservation } = require("./page-state");
+const { observePageGraph, summarizeGraph } = require("./observation");
+const { diffPageGraphs } = require("./observation/diff");
 const { executeAction } = require("./executor");
 const {
   ANALYZER_SYSTEM,
@@ -27,9 +29,12 @@ const ESSENTIAL_RUN_EVENTS = new Set([
   "run_started",
   "block_planned",
   "action_target_model_resolved",
+  "node_target_resolved",
   "action_start",
   "action_target_resolved",
   "page_snapshot",
+  "page_graph_snapshot",
+  "page_graph_diff",
   "block_finished",
   "analysis_dead_end_recovering",
   "thread_memory_plan_blocked",
@@ -541,6 +546,7 @@ function collectActionIdentifiers(actionResult, observation) {
   return [
     actionResult?.label,
     actionResult?.type,
+    actionResult?.nodeId,
     resolved.url,
     resolved.elementId,
     resolved.text,
@@ -670,6 +676,7 @@ function isStrongIdentifier(value) {
 function collectPlannedActionIdentifiers(action) {
   return [
     action?.elementId,
+    action?.nodeId,
     action?.url,
     action?.text,
     action?.inputHint,
@@ -682,6 +689,10 @@ function collectPlannedActionIdentifiers(action) {
 
 function actionElementId(action) {
   return String(action?.elementId || "").trim();
+}
+
+function actionNodeId(action) {
+  return String(action?.nodeId || "").trim();
 }
 
 function actionAccessibleTarget(action) {
@@ -719,16 +730,23 @@ function actionNeedsModelTarget(action, observation = null) {
       return false;
     }
     const elementId = actionElementId(action);
+    const nodeId = actionNodeId(action);
     if (type === "click_element" && actionAccessibleTarget(action)) {
       return false;
     }
-    if (!elementId) {
+    if (!elementId && !nodeId) {
       return true;
     }
     if (!observation || !Array.isArray(observation.interactive)) {
       return false;
     }
-    return !observation.interactive.some((element) => String(element?.id || "").trim() === elementId);
+    if (elementId && observation.interactive.some((element) => String(element?.id || "").trim() === elementId)) {
+      return false;
+    }
+    if (nodeId && graphNodeById(observation.pageGraph, nodeId)) {
+      return false;
+    }
+    return true;
   }
 
   return type === "click_by_text";
@@ -736,12 +754,13 @@ function actionNeedsModelTarget(action, observation = null) {
 
 function applyResolvedTarget(action, resolution) {
   const elementId = String(resolution?.elementId || "").trim();
+  const nodeId = String(resolution?.nodeId || "").trim();
   const targetReason = String(resolution?.targetReason || "").trim();
   const targetRole = compactText(resolution?.targetRole || resolution?.accessibilityRole || resolution?.role);
   const targetName = String(resolution?.targetName || resolution?.accessibilityName || resolution?.name || "").trim();
   const type = compactText(action?.type);
 
-  if (!elementId && !(type === "click_element" && targetRole && targetName)) {
+  if (!elementId && !nodeId && !(type === "click_element" && targetRole && targetName)) {
     return action;
   }
 
@@ -750,6 +769,7 @@ function applyResolvedTarget(action, resolution) {
       ...action,
       type: "click_element",
       elementId,
+      nodeId,
       targetReason,
       note: action.note || action.text || action.label || "",
     };
@@ -758,8 +778,115 @@ function applyResolvedTarget(action, resolution) {
   return {
     ...action,
     elementId,
+    nodeId,
     targetReason,
     ...(targetRole && targetName ? { targetRole, targetName } : {}),
+  };
+}
+
+function graphNodeById(pageGraph, nodeId) {
+  const targetId = String(nodeId || "").trim();
+  if (!targetId || !pageGraph) {
+    return null;
+  }
+
+  const buckets = [
+    pageGraph.interactive,
+    pageGraph.forms,
+    pageGraph.dialogs,
+    pageGraph.landmarks,
+    pageGraph.validationMessages,
+    pageGraph.media,
+    pageGraph.frames,
+    pageGraph.textBlocks,
+    pageGraph.activeElement ? [pageGraph.activeElement] : [],
+  ];
+
+  for (const bucket of buckets) {
+    for (const node of bucket || []) {
+      if (String(node?.nodeId || "").trim() === targetId) {
+        return node;
+      }
+    }
+  }
+
+  return null;
+}
+
+function nodeResolutionError(code, message, action, nodeId, details = {}) {
+  const error = new Error(message);
+  error.name = "NodeTargetResolutionError";
+  error.code = code;
+  error.action = action;
+  error.nodeId = nodeId;
+  error.details = details;
+  return error;
+}
+
+function resolveNodeIdActionTarget(action, observation, logger, threadId, cycle) {
+  const nodeId = actionNodeId(action);
+  const type = compactText(action?.type);
+  if (!nodeId || actionElementId(action) || !["insert", "upload_media", "click_element", "type_element"].includes(type)) {
+    return action;
+  }
+
+  const node = graphNodeById(observation?.pageGraph, nodeId);
+  if (!node) {
+    throw nodeResolutionError(
+      "NODE_STALE",
+      `AgentPageGraph node "${nodeId}" is no longer present in the latest page graph.`,
+      action,
+      nodeId,
+    );
+  }
+
+  if (node.disabled) {
+    throw nodeResolutionError(
+      "NODE_DISABLED",
+      `AgentPageGraph node "${nodeId}" is disabled and cannot be targeted safely.`,
+      action,
+      nodeId,
+      { role: node.role || "", name: node.name || "", tag: node.tag || "" },
+    );
+  }
+
+  if (node.visible === false) {
+    throw nodeResolutionError(
+      "NODE_NOT_VISIBLE",
+      `AgentPageGraph node "${nodeId}" is not visible in the latest page graph.`,
+      action,
+      nodeId,
+      { role: node.role || "", name: node.name || "", tag: node.tag || "" },
+    );
+  }
+
+  const atlasId = String(node.atlasId || "").trim();
+  if (!atlasId) {
+    throw nodeResolutionError(
+      "NODE_NOT_EXECUTABLE",
+      `AgentPageGraph node "${nodeId}" has no current executable atlas target.`,
+      action,
+      nodeId,
+      { role: node.role || "", name: node.name || "", tag: node.tag || "" },
+    );
+  }
+
+  logger.event("agent.service", "node_target_resolved", {
+    threadId,
+    cycle,
+    nodeId,
+    elementId: atlasId,
+    actionType: action.type || "",
+    role: node.role || "",
+    name: node.name || "",
+    tag: node.tag || "",
+  });
+
+  return {
+    ...action,
+    elementId: atlasId,
+    resolvedNodeId: nodeId,
+    targetReason: action.targetReason || `Resolved AgentPageGraph node ${nodeId}`,
   };
 }
 
@@ -1053,6 +1180,7 @@ async function resolveActionTargetWithModel({
   });
   const resolution = result.data || {};
   const resolvedElementId = String(resolution.elementId || "").trim();
+  const resolvedNodeId = String(resolution.nodeId || "").trim();
   const resolvedTargetRole = compactText(
     resolution.targetRole || resolution.accessibilityRole || resolution.role,
   );
@@ -1063,7 +1191,7 @@ async function resolveActionTargetWithModel({
     (packet.relevantElements || []).map((element) => String(element?.id || "").trim()).filter(Boolean),
   );
 
-  if (!resolution.canResolve || (!resolvedElementId && !(resolvedTargetRole && resolvedTargetName))) {
+  if (!resolution.canResolve || (!resolvedElementId && !resolvedNodeId && !(resolvedTargetRole && resolvedTargetName))) {
     const error = new Error(
       String(resolution.targetReason || "").trim() ||
         `The model could not resolve a target for ${action?.type || "action"}.`,
@@ -1084,15 +1212,26 @@ async function resolveActionTargetWithModel({
     throw error;
   }
 
+  if (resolvedNodeId && !graphNodeById(observation.pageGraph, resolvedNodeId)) {
+    const error = new Error(`The model returned nodeId "${resolvedNodeId}", but it was not in the latest AgentPageGraph.`);
+    error.name = "TargetResolutionError";
+    error.code = "NODE_NOT_IN_GRAPH";
+    error.action = action;
+    error.resolution = resolution;
+    throw error;
+  }
+
   const safeResolution = {
     ...resolution,
     elementId: resolvedElementId && candidateIds.has(resolvedElementId) ? resolvedElementId : "",
+    nodeId: resolvedNodeId,
   };
   const resolved = applyResolvedTarget(action, safeResolution);
   logger.event("agent.service", "action_target_model_resolved", {
     originalType: action?.type || "",
     resolvedType: resolved?.type || "",
     elementId: resolved.elementId || "",
+    nodeId: resolved.nodeId || "",
     targetRole: resolved.targetRole || "",
     targetName: resolved.targetName || "",
     targetReason: resolved.targetReason || "",
@@ -1191,7 +1330,9 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
         cleanedHtml: "",
         interactive: [],
         screenshotPath: "",
+        pageGraph: null,
       },
+      lastPageGraph: null,
       recoveryAttempts: 0,
       pendingGoals: [],
       running: false,
@@ -1279,10 +1420,19 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
       logger: activeLogger,
       captureScreenshot: Boolean(options.captureScreenshot),
     });
+    const pageGraph = await observePageGraph({
+      canvas: runtime.canvas,
+      threadId,
+      logger: activeLogger,
+      screenshotPath: observation.screenshotPath || "",
+    });
+    observation.pageGraph = pageGraph;
     runtime.lastObservation = observation;
+    runtime.lastPageGraph = pageGraph;
     store.updateMeta(threadId, {
       lastKnownUrl: observation.page.url,
       lastKnownTitle: observation.page.title,
+      lastPageGraphSummary: summarizeGraph(pageGraph),
     });
     return observation;
   }
@@ -1671,6 +1821,7 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
           }
 
           const observationBeforeAction = runtime.lastObservation || observation;
+          const graphBeforeAction = observationBeforeAction.pageGraph || runtime.lastPageGraph || null;
           let executableAction = action;
           const actionResult = {
             type: action.type,
@@ -1690,10 +1841,18 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
               lastError,
               logger: runLogger,
             });
+            executableAction = resolveNodeIdActionTarget(
+              executableAction,
+              observationBeforeAction,
+              runLogger,
+              threadId,
+              cycle,
+            );
             actionResult.type = executableAction.type;
             actionResult.label = describeAction(executableAction);
             actionResult.targetReason = executableAction.targetReason || "";
             actionResult.resolvedByModel = executableAction !== action;
+            actionResult.nodeId = executableAction.resolvedNodeId || executableAction.nodeId || "";
 
             const executionResult = await executeAction({
               action: {
@@ -1716,11 +1875,27 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
                 resolvedTarget: executionResult.resolvedTarget,
               });
             }
-            await observe(threadId, runtime, runLogger);
+            const afterActionObservation = await observe(threadId, runtime, runLogger);
+            if (graphBeforeAction && afterActionObservation.pageGraph) {
+              actionResult.graphDiff = diffPageGraphs(graphBeforeAction, afterActionObservation.pageGraph);
+              runLogger.event("agent.service", "page_graph_diff", {
+                threadId,
+                cycle,
+                actionType: actionResult.type,
+                label: actionResult.label || "",
+                diff: actionResult.graphDiff,
+              });
+            }
           } catch (error) {
             blockError = error instanceof Error ? error.message : String(error);
             actionResult.status = "failed";
             actionResult.error = blockError;
+            if (error?.code) {
+              actionResult.errorCode = error.code;
+            }
+            if (error?.nodeId) {
+              actionResult.nodeId = error.nodeId;
+            }
             store.updateMeta(threadId, {
               lastRunError: blockError,
             });
@@ -1738,6 +1913,9 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
         }
 
         const analyzedObservation = await observe(threadId, runtime, runLogger);
+        const blockGraphDiff = observation.pageGraph && analyzedObservation.pageGraph
+          ? diffPageGraphs(observation.pageGraph, analyzedObservation.pageGraph)
+          : null;
         const analyzerPacket = buildObservationPacket(analyzedObservation, {
           mode: inferStepMode({
             userGoal,
@@ -1755,6 +1933,7 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
             userGoal,
             observationPacket: analyzerPacket,
             executedActions: actionResults,
+            graphDiff: blockGraphDiff,
             recentMessages: recentThreadMessages(store.getThread(threadId)),
             blockComment: plan.comment || "",
             blockError,

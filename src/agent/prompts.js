@@ -212,6 +212,9 @@ ${JSON.stringify(observationPacket.pageSemantics || {}, null, 2)}
 Flow summary:
 ${JSON.stringify(observationPacket.flow || {}, null, 2)}
 
+AgentPageGraph prompt view:
+${observationPacket.pageGraph ? JSON.stringify(observationPacket.pageGraph, null, 2) : "<not available>"}
+
 Recent thread messages:
 ${recentMessages.join("\n")}
 
@@ -263,19 +266,19 @@ Keep the block short: 1 to 3 actions.
 Allowed action types:
 - open_url { "type": "open_url", "url": "https://..." }
 - open_search { "type": "open_search", "query": "...", "engine": "duckduckgo|bing|ya" }
-- insert { "type": "insert", "text": "...", "elementId": "required atlas-... when an input is visible", "submit": false, "submitKey": "optional Enter", "targetReason": "why this element is the right target" }
-- click_element { "type": "click_element", "elementId": "atlas-..." } OR { "type": "click_element", "targetRole": "button|link|tab|menuitem|checkbox|textbox", "targetName": "exact accessible name from ARIA snapshot" }
+- insert { "type": "insert", "text": "...", "elementId": "atlas-... when available", "nodeId": "optional n_... from AgentPageGraph", "submit": false, "submitKey": "optional Enter", "targetReason": "why this element is the right target" }
+- click_element { "type": "click_element", "elementId": "atlas-..." } OR { "type": "click_element", "nodeId": "n_..." } OR { "type": "click_element", "targetRole": "button|link|tab|menuitem|checkbox|textbox", "targetName": "exact accessible name from ARIA snapshot" }
 - press_key { "type": "press_key", "key": "Enter" }
 - scroll { "type": "scroll", "deltaY": 320, "note": "optional reason" }
 - read_page { "type": "read_page", "loops": 1 }
-- upload_media { "type": "upload_media", "mediaRef": "first_media|first_image|first_video|all_media|all_images|all_videos|media:<id>", "elementId": "optional atlas-... for the current composer/paste surface when obvious", "note": "optional reason", "targetReason": "optional reason" }
+- upload_media { "type": "upload_media", "mediaRef": "first_media|first_image|first_video|all_media|all_images|all_videos|media:<id>", "elementId": "optional atlas-... for the current composer/paste surface when obvious", "nodeId": "optional n_... from AgentPageGraph", "note": "optional reason", "targetReason": "optional reason" }
 
 Every action must also include:
 - label: short UI label in the same language as the user's latest message, for example "Open Wikipedia" or "Type search query"
 - shortcutKey: optional recipe key when you are intentionally reusing one of the retrieved site shortcuts
 
 Rules:
-- Use elementId actions when the current page already exposes a matching target. For insert, selecting the concrete elementId is part of your job as the model. For upload_media, elementId is optional because the runtime can paste into the active composer/paste surface; include an elementId only when the composer/editor/drop zone is obvious. For click_element, prefer elementId when available; if the target is clearly present in the ARIA/accessibility snapshot but absent from interactive candidates, use targetRole + exact targetName from the ARIA snapshot.
+- Use elementId actions when the current page already exposes a matching atlas-* target. You may use AgentPageGraph nodeId when it is the clearest target reference in the graph; the runtime will resolve nodeId to the current executable atlas target before execution. For insert, selecting the concrete elementId or nodeId is part of your job as the model. For upload_media, elementId or nodeId is optional because the runtime can paste into the active composer/paste surface; include a target only when the composer/editor/drop zone is obvious. For click_element, prefer elementId or nodeId when available; if the target is clearly present in the ARIA/accessibility snapshot but absent from interactive candidates, use targetRole + exact targetName from the ARIA snapshot.
 - If the desired target is present in Relevant interactive elements with an elementId but has inViewport:false or offscreen bounds, still prefer the direct elementId action. The runtime can scroll the target into view during click, insert, or upload; do not spend repeated blocks on scroll+read just to make a known target visible.
 - Session memory has higher priority than shortcuts, weak heuristics, and vague guesses.
 - Retrieved site shortcuts are optional accelerators, not commands. Reuse them only if the current page signals clearly match the shortcut target hints.
@@ -358,7 +361,7 @@ ${userGoal}
 
 You are resolving the concrete browser target for one already-planned action.
 The runtime will not guess from keywords or CSS classes. You must choose a visible
-element id from the observation. For click_element only, if the target is clearly
+element id from the observation or an exact AgentPageGraph nodeId. For click_element only, if the target is clearly
 present in the ARIA/accessibility snapshot but absent from interactive candidates,
 you may instead return an exact accessibility target: targetRole + targetName.
 
@@ -373,6 +376,9 @@ ${JSON.stringify(observationPacket.page, null, 2)}
 
 Page semantics:
 ${JSON.stringify(observationPacket.pageSemantics || {}, null, 2)}
+
+AgentPageGraph prompt view:
+${observationPacket.pageGraph ? JSON.stringify(observationPacket.pageGraph, null, 2) : "<not available>"}
 
 Recent thread messages:
 ${recentMessages.join("\n")}
@@ -394,6 +400,7 @@ ${observationPacket.cleanedHtml || "<empty>"}
 
 Rules:
 - Return an elementId only if it appears in the interactive candidates.
+- You may return nodeId only if it appears in AgentPageGraph prompt view and represents the exact intended node. Prefer elementId when both are available.
 - For click_element only, if no matching elementId exists but ARIA contains an exact actionable node, return canResolve true with targetRole and targetName copied exactly from that ARIA node.
 - Do not invent selectors, labels, or element ids.
 - Do not invent accessibility names. targetName must be the exact accessible name shown in ARIA.
@@ -407,6 +414,7 @@ Return JSON only:
 {
   "canResolve": true,
   "elementId": "atlas-... or empty for upload_media active paste surface",
+  "nodeId": "n_... optional AgentPageGraph node id when clearer than elementId",
   "targetRole": "button",
   "targetName": "Exact accessible name, only when elementId is unavailable for click_element",
   "targetReason": "Short reason grounded in visible facts.",
@@ -419,6 +427,7 @@ function buildAnalyzerPrompt({
   userGoal,
   observationPacket,
   executedActions,
+  graphDiff,
   recentMessages,
   blockComment,
   blockError,
@@ -445,6 +454,9 @@ Agent identity and operating contract:
 Executed actions:
 ${JSON.stringify(executedActions, null, 2)}
 
+AgentPageGraph diff for this block:
+${graphDiff ? JSON.stringify(graphDiff, null, 2) : "<not available>"}
+
 Block comment:
 ${blockComment || "None"}
 
@@ -465,6 +477,9 @@ ${JSON.stringify(observationPacket.pageSemantics || {}, null, 2)}
 
 Flow summary:
 ${JSON.stringify(observationPacket.flow || {}, null, 2)}
+
+AgentPageGraph prompt view:
+${observationPacket.pageGraph ? JSON.stringify(observationPacket.pageGraph, null, 2) : "<not available>"}
 
 Recent thread messages:
 ${recentMessages.join("\n")}
@@ -500,6 +515,7 @@ Relevant interactive elements:
 ${formatInteractive(observationPacket.relevantElements || []) || "<none>"}
 
 Analyze what happened after the last block.
+Use the AgentPageGraph diff as the primary structured evidence for whether the page changed as intended. Treat action-level graphDiff entries inside Executed actions as per-action evidence.
 If the HTML/text snapshot is too weak, noisy, or inconclusive, request screenshot fallback.
 Be strict about semantic mismatches:
 - If text was typed into a search field, command palette, or dialog when the goal was to send a message or fill a main-page form, call that out explicitly.
