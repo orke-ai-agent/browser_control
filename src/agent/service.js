@@ -4,6 +4,8 @@ const { createGeminiClient } = require("./gemini");
 const { captureObservation } = require("./page-state");
 const { observePageGraph, summarizeGraph } = require("./observation");
 const { diffPageGraphs } = require("./observation/diff");
+const { graphNodeById, resolveNodeActionTarget } = require("./observation/node-resolver");
+const { graphFlowSignature, inferGraphStepMode } = require("./observation/routing");
 const { executeAction } = require("./executor");
 const {
   ANALYZER_SYSTEM,
@@ -15,16 +17,14 @@ const {
   buildVisualAnalyzerPrompt,
 } = require("./prompts");
 const { buildObservationPacket } = require("./context-packer");
-const {
-  inferActionFamilyFromText,
-  inferFlowProfile,
-  inferStepMode,
-} = require("./semantic");
 
 const MAX_RECOVERY_ATTEMPTS = 2;
 const DEFAULT_STEP_LIMIT = 5;
 const MAX_GEMINI_503_RETRIES_PER_STEP = 3;
 const GEMINI_503_BACKOFF_MS = 1500;
+const MAX_GEMINI_503_RUN_PAUSES = 8;
+const GEMINI_503_RUN_BACKOFF_BASE_MS = 15000;
+const GEMINI_503_RUN_BACKOFF_MAX_MS = 300000;
 const ESSENTIAL_RUN_EVENTS = new Set([
   "run_started",
   "block_planned",
@@ -34,12 +34,15 @@ const ESSENTIAL_RUN_EVENTS = new Set([
   "action_target_resolved",
   "page_snapshot",
   "page_graph_snapshot",
-  "page_graph_diff",
+  "decision_trace",
+  "outcome_trace",
   "block_finished",
   "analysis_dead_end_recovering",
   "thread_memory_plan_blocked",
   "gemini_503_retry_scheduled",
   "gemini_503_retry_exhausted",
+  "gemini_503_run_paused",
+  "gemini_503_run_resume_scheduled",
   "run_failed",
   "run_finished",
 ]);
@@ -224,9 +227,24 @@ function isGemini503Error(error) {
   return Number(error?.status || 0) === 503;
 }
 
+function gemini503RunBackoffMs(pauseCount) {
+  const exponent = Math.max(0, Number(pauseCount || 1) - 1);
+  return Math.min(GEMINI_503_RUN_BACKOFF_MAX_MS, GEMINI_503_RUN_BACKOFF_BASE_MS * (2 ** exponent));
+}
+
+function gemini503StepBackoffMs(attempt) {
+  const exponent = Math.max(0, Number(attempt || 1) - 1);
+  return Math.min(10000, GEMINI_503_BACKOFF_MS * (2 ** exponent));
+}
+
 function buildGemini503StopMessage(task) {
   const taskLabel = String(task || "step").trim() || "step";
   return `Gemini returned HTTP 503 three times during ${taskLabel}. Stopping this run to avoid hammering the API.`;
+}
+
+function buildGemini503PauseMessage(task, resumeAt) {
+  const taskLabel = String(task || "step").trim() || "step";
+  return `Gemini is overloaded during ${taskLabel}. I paused this run and will retry automatically at ${resumeAt}.`;
 }
 
 function collectUsedShortcuts(actions, retrievedShortcuts) {
@@ -240,6 +258,47 @@ function collectUsedShortcuts(actions, retrievedShortcuts) {
   }
 
   return [...keys].map((key) => shortcutMap.get(key) || { key });
+}
+
+function summarizeTraceAction(action) {
+  return {
+    type: String(action?.type || "").trim(),
+    label: String(action?.label || "").trim(),
+    elementId: String(action?.elementId || "").trim(),
+    nodeId: String(action?.nodeId || "").trim(),
+    targetRole: String(action?.targetRole || action?.accessibilityRole || action?.role || "").trim(),
+    targetName: String(action?.targetName || action?.accessibilityName || action?.name || "").trim(),
+    mediaRef: String(action?.mediaRef || "").trim(),
+    url: String(action?.url || "").trim(),
+    query: String(action?.query || "").trim(),
+    targetReason: String(action?.targetReason || action?.note || "").trim().slice(0, 300),
+  };
+}
+
+function summarizeTraceActionResult(action) {
+  const resolved = action?.resolvedTarget || {};
+  return {
+    type: String(action?.type || "").trim(),
+    label: String(action?.label || "").trim(),
+    status: String(action?.status || "").trim(),
+    errorCode: String(action?.errorCode || "").trim(),
+    error: String(action?.error || "").trim().slice(0, 300),
+    resolvedKind: String(resolved.kind || "").trim(),
+    resolvedRole: String(resolved.role || "").trim(),
+    resolvedName: String(resolved.visibleName || resolved.name || resolved.label || "").trim().slice(0, 160),
+    uploadMethod: String(resolved.uploadMethod || "").trim(),
+    mediaCount: Number(resolved.mediaCount || 0),
+  };
+}
+
+function summarizeTraceObservation(observation) {
+  return {
+    title: String(observation?.page?.title || "").trim(),
+    url: String(observation?.page?.url || "").trim(),
+    interactiveCount: Array.isArray(observation?.interactive) ? observation.interactive.length : 0,
+    graphCounts: observation?.pageGraph ? summarizeGraph(observation.pageGraph).counts : null,
+    modality: observation?.pageGraph?.modality || null,
+  };
 }
 
 function sanitizeShortcutKey(shortcutKey, retrievedShortcuts, logger, threadId, cycle) {
@@ -674,14 +733,12 @@ function isStrongIdentifier(value) {
 }
 
 function collectPlannedActionIdentifiers(action) {
+  const accessibleTarget = actionAccessibleTarget(action);
   return [
     action?.elementId,
     action?.nodeId,
     action?.url,
-    action?.text,
-    action?.inputHint,
-    action?.label,
-    action?.note,
+    accessibleTarget ? `${accessibleTarget.role} | ${accessibleTarget.name}` : "",
   ]
     .map(normalizeIdentifier)
     .filter(Boolean);
@@ -781,112 +838,6 @@ function applyResolvedTarget(action, resolution) {
     nodeId,
     targetReason,
     ...(targetRole && targetName ? { targetRole, targetName } : {}),
-  };
-}
-
-function graphNodeById(pageGraph, nodeId) {
-  const targetId = String(nodeId || "").trim();
-  if (!targetId || !pageGraph) {
-    return null;
-  }
-
-  const buckets = [
-    pageGraph.interactive,
-    pageGraph.forms,
-    pageGraph.dialogs,
-    pageGraph.landmarks,
-    pageGraph.validationMessages,
-    pageGraph.media,
-    pageGraph.frames,
-    pageGraph.textBlocks,
-    pageGraph.activeElement ? [pageGraph.activeElement] : [],
-  ];
-
-  for (const bucket of buckets) {
-    for (const node of bucket || []) {
-      if (String(node?.nodeId || "").trim() === targetId) {
-        return node;
-      }
-    }
-  }
-
-  return null;
-}
-
-function nodeResolutionError(code, message, action, nodeId, details = {}) {
-  const error = new Error(message);
-  error.name = "NodeTargetResolutionError";
-  error.code = code;
-  error.action = action;
-  error.nodeId = nodeId;
-  error.details = details;
-  return error;
-}
-
-function resolveNodeIdActionTarget(action, observation, logger, threadId, cycle) {
-  const nodeId = actionNodeId(action);
-  const type = compactText(action?.type);
-  if (!nodeId || actionElementId(action) || !["insert", "upload_media", "click_element", "type_element"].includes(type)) {
-    return action;
-  }
-
-  const node = graphNodeById(observation?.pageGraph, nodeId);
-  if (!node) {
-    throw nodeResolutionError(
-      "NODE_STALE",
-      `AgentPageGraph node "${nodeId}" is no longer present in the latest page graph.`,
-      action,
-      nodeId,
-    );
-  }
-
-  if (node.disabled) {
-    throw nodeResolutionError(
-      "NODE_DISABLED",
-      `AgentPageGraph node "${nodeId}" is disabled and cannot be targeted safely.`,
-      action,
-      nodeId,
-      { role: node.role || "", name: node.name || "", tag: node.tag || "" },
-    );
-  }
-
-  if (node.visible === false) {
-    throw nodeResolutionError(
-      "NODE_NOT_VISIBLE",
-      `AgentPageGraph node "${nodeId}" is not visible in the latest page graph.`,
-      action,
-      nodeId,
-      { role: node.role || "", name: node.name || "", tag: node.tag || "" },
-    );
-  }
-
-  const atlasId = String(node.atlasId || "").trim();
-  if (!atlasId) {
-    throw nodeResolutionError(
-      "NODE_NOT_EXECUTABLE",
-      `AgentPageGraph node "${nodeId}" has no current executable atlas target.`,
-      action,
-      nodeId,
-      { role: node.role || "", name: node.name || "", tag: node.tag || "" },
-    );
-  }
-
-  logger.event("agent.service", "node_target_resolved", {
-    threadId,
-    cycle,
-    nodeId,
-    elementId: atlasId,
-    actionType: action.type || "",
-    role: node.role || "",
-    name: node.name || "",
-    tag: node.tag || "",
-  });
-
-  return {
-    ...action,
-    elementId: atlasId,
-    resolvedNodeId: nodeId,
-    targetReason: action.targetReason || `Resolved AgentPageGraph node ${nodeId}`,
   };
 }
 
@@ -1052,11 +1003,10 @@ function detectShortcutMismatch({
     return true;
   }
 
-  const nextMode = inferActionFamilyFromText(analysis.nextFocus || "");
-  const preFlow = inferFlowProfile(preObservation).flowKey;
-  const postFlow = inferFlowProfile(postObservation).flowKey;
+  const preFlow = graphFlowSignature(preObservation);
+  const postFlow = graphFlowSignature(postObservation);
 
-  return nextMode === stepMode && preFlow === postFlow;
+  return stepMode !== "generic" && preFlow === postFlow;
 }
 
 async function planWithRetry({
@@ -1401,11 +1351,12 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
           throw finalError;
         }
 
+        const retryInMs = gemini503StepBackoffMs(attempt);
         activeLogger.warn("agent.service", "gemini_503_retry_scheduled", {
           ...details,
-          retryInMs: GEMINI_503_BACKOFF_MS,
+          retryInMs,
         });
-        await wait(GEMINI_503_BACKOFF_MS);
+        await wait(retryInMs);
       }
     }
 
@@ -1478,6 +1429,7 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
     runLogger.event("agent.service", "run_started", {
       userGoal,
     });
+    let gemini503ResumeDelayMs = 0;
     const threadAtStart = store.getThread(threadId);
     const preservedSessionMemory = (threadAtStart?.meta?.sessionMemory || []).filter((entry) => {
       const key = String(entry?.key || "").trim();
@@ -1593,7 +1545,7 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
         const mediaAttachments = Array.isArray(thread.meta?.mediaAttachments)
           ? thread.meta.mediaAttachments
           : [];
-        const stepMode = inferStepMode({
+        const stepMode = inferGraphStepMode({
           userGoal,
           priorAnalysis,
           observation,
@@ -1770,6 +1722,20 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
           retrievedShortcutKeys: retrievedShortcuts.map((shortcut) => shortcut.key),
           actions,
         });
+        runLogger.event("agent.service", "decision_trace", {
+          threadId,
+          cycle,
+          phase: "planned",
+          page: summarizeTraceObservation(observation),
+          stepMode,
+          contextLevel: planResult.contextLevel,
+          retryMode: planResult.retryMode,
+          comment: String(plan.comment || "").trim(),
+          goal: String(plan.blockGoal || "").trim(),
+          why: String(plan.reason || plan.targetReason || "").trim().slice(0, 500),
+          actions: actions.map(summarizeTraceAction),
+          shortcutKeys: retrievedShortcuts.map((shortcut) => shortcut.key).slice(0, 6),
+        });
 
         if (!actions.length) {
           const failureReport = buildPlanningFailureReport({
@@ -1841,12 +1807,14 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
               lastError,
               logger: runLogger,
             });
-            executableAction = resolveNodeIdActionTarget(
+            executableAction = resolveNodeActionTarget(
               executableAction,
               observationBeforeAction,
-              runLogger,
-              threadId,
-              cycle,
+              {
+                logger: runLogger,
+                threadId,
+                cycle,
+              },
             );
             actionResult.type = executableAction.type;
             actionResult.label = describeAction(executableAction);
@@ -1917,7 +1885,7 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
           ? diffPageGraphs(observation.pageGraph, analyzedObservation.pageGraph)
           : null;
         const analyzerPacket = buildObservationPacket(analyzedObservation, {
-          mode: inferStepMode({
+          mode: inferGraphStepMode({
             userGoal,
             priorAnalysis,
             observation: analyzedObservation,
@@ -2118,6 +2086,29 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
           shortcutMismatch,
           usage: blockUsage,
         });
+        runLogger.event("agent.service", "outcome_trace", {
+          threadId,
+          cycle,
+          phase: "analyzed",
+          status: blockStatus,
+          page: summarizeTraceObservation(analyzedObservation),
+          actions: actionResults.map(summarizeTraceActionResult),
+          analysis: {
+            status: String(analysis?.outcomeStatus || analysis?.sourceStatus || "").trim(),
+            comment: String(analysis?.comment || "").trim().slice(0, 500),
+            failureReason: String(analysis?.failureReason || "").trim().slice(0, 500),
+            nextFocus: String(analysis?.nextFocus || "").trim().slice(0, 500),
+            taskComplete: Boolean(analysis?.taskComplete),
+            needsVisualFallback: Boolean(analysis?.needsVisualFallback),
+          },
+          journalDelta: journalDelta.map((entry) => ({
+            status: String(entry.status || "").trim(),
+            outcome: String(entry.outcome || "").trim().slice(0, 300),
+            why: String(entry.why || "").trim().slice(0, 300),
+            nextGuidance: String(entry.nextGuidance || "").trim().slice(0, 300),
+          })),
+          usage: blockUsage,
+        });
 
         if (analysis.taskComplete) {
           store.updateMeta(threadId, {
@@ -2206,28 +2197,93 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
         priorAnalysis = analysis;
       }
     } catch (error) {
-      runLogger.error("agent.service", "run_failed", error, {
-        threadId,
-      });
-      addAssistantMessage(
-        threadId,
-        "error",
-        localize(
-          responseLanguage,
-          error instanceof Error ? error.message : String(error),
-          error instanceof Error ? error.message : String(error),
-        ),
-      );
+      if (isGemini503Error(error)) {
+        const latestThread = store.getThread(threadId);
+        const pauseCount = Number(latestThread?.meta?.gemini503RunPauseCount || 0) + 1;
+        gemini503ResumeDelayMs = gemini503RunBackoffMs(pauseCount);
+        const resumeAt = new Date(Date.now() + gemini503ResumeDelayMs).toISOString();
+        const task = String(error?.task || error?.cause?.task || "LLM request").trim();
+        const pauseMessage = pauseCount > MAX_GEMINI_503_RUN_PAUSES
+          ? buildGemini503StopMessage(task)
+          : buildGemini503PauseMessage(task, resumeAt);
+
+        store.updateMeta(threadId, {
+          gemini503RunPauseCount: pauseCount,
+          gemini503ResumeAt: pauseCount > MAX_GEMINI_503_RUN_PAUSES ? "" : resumeAt,
+          lastRunError: pauseMessage,
+        });
+
+        runLogger.warn("agent.service", "gemini_503_run_paused", {
+          threadId,
+          task,
+          pauseCount,
+          maxPauses: MAX_GEMINI_503_RUN_PAUSES,
+          resumeInMs: gemini503ResumeDelayMs,
+          resumeAt,
+        });
+
+        addAssistantMessage(
+          threadId,
+          pauseCount > MAX_GEMINI_503_RUN_PAUSES ? "error" : "block",
+          pauseMessage,
+          {
+            phase: pauseCount > MAX_GEMINI_503_RUN_PAUSES ? "gemini_503_exhausted" : "gemini_503_backoff",
+            status: pauseCount > MAX_GEMINI_503_RUN_PAUSES ? "failed" : "paused",
+            task,
+            pauseCount,
+            maxPauses: MAX_GEMINI_503_RUN_PAUSES,
+            resumeAt: pauseCount > MAX_GEMINI_503_RUN_PAUSES ? "" : resumeAt,
+          },
+        );
+
+        if (pauseCount > MAX_GEMINI_503_RUN_PAUSES) {
+          gemini503ResumeDelayMs = 0;
+        }
+      } else {
+        runLogger.error("agent.service", "run_failed", error, {
+          threadId,
+        });
+        addAssistantMessage(
+          threadId,
+          "error",
+          localize(
+            responseLanguage,
+            error instanceof Error ? error.message : String(error),
+            error instanceof Error ? error.message : String(error),
+          ),
+        );
+      }
     } finally {
       runtime.stopRequested = false;
       runtime.running = false;
-      store.setStatus(threadId, "idle");
+      const shouldResumeAfter503 = gemini503ResumeDelayMs > 0;
+      store.setStatus(threadId, shouldResumeAfter503 ? "submitted" : "idle");
+      if (!shouldResumeAfter503) {
+        store.updateMeta(threadId, {
+          gemini503ResumeAt: "",
+          gemini503RunPauseCount: 0,
+        });
+      }
       runLogger.event("agent.service", "run_finished", {
-        status: "idle",
+        status: shouldResumeAfter503 ? "submitted" : "idle",
         pendingCount: runtime.pendingGoals.length,
       });
 
-      if (runtime.pendingGoals.length) {
+      if (shouldResumeAfter503) {
+        runLogger.event("agent.service", "gemini_503_run_resume_scheduled", {
+          threadId,
+          resumeInMs: gemini503ResumeDelayMs,
+        });
+        setTimeout(() => {
+          runLoop(threadId, userGoal).catch((resumeError) => {
+            runLogger.error("agent.service", "gemini_503_resume_failed", resumeError, {
+              threadId,
+            });
+          });
+        }, gemini503ResumeDelayMs);
+      }
+
+      if (!shouldResumeAfter503 && runtime.pendingGoals.length) {
         const nextGoal = runtime.pendingGoals.shift();
         runLogger.event("agent.service", "dequeue_goal_after_run", {
           threadId,

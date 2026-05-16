@@ -1,8 +1,8 @@
-const {
-  compact,
-  inferFlowProfile,
-} = require("./semantic");
 const { buildGraphPromptView } = require("./observation/prompt-view");
+
+function compact(value) {
+  return String(value || "").trim().toLowerCase();
+}
 
 function pickFields(element, fields) {
   const payload = {};
@@ -279,18 +279,25 @@ function buildObservationPacket(observation, { mode, expanded }) {
     };
   }
 
-  const profile = inferFlowProfile(observation);
+  const host = hostFromUrl(observation?.page?.url || "");
   const packet = {
     mode,
     contextLevel: expanded ? "expanded" : "compact",
     page: observation.page,
     pageSemantics: observation.pageSemantics || {},
     flow: {
-      site: profile.site,
-      host: profile.host,
-      pageKind: profile.pageKind,
-      flowKey: profile.flowKey,
-      tokens: profile.tokens,
+      host,
+      modality: "legacy_snapshot",
+      flowKey: [
+        host || "unknown_host",
+        observation?.pageSemantics?.dialogOpen ? "dialog_open" : "dialog_closed",
+        observation?.pageSemantics?.focusedEditableId ? "focus_active" : "focus_none",
+      ].join("|"),
+      tokens: [
+        host ? `host_${host}` : "host_unknown",
+        observation?.pageSemantics?.dialogOpen ? "dialog_open" : "dialog_closed",
+        observation?.pageSemantics?.focusedEditableId ? "focus_active" : "focus_none",
+      ],
     },
     relevantElements: selectCandidates(observation.interactive, mode, expanded),
   };

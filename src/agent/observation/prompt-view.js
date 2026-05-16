@@ -16,6 +16,11 @@ function pickFields(source, fields) {
 
 function asLegacyElement(node) {
   const visibleName = node?.name || node?.text || node?.placeholder || "";
+  const iconText = [
+    ...(Array.isArray(node?.icon?.svgTitles) ? node.icon.svgTitles : []),
+    ...(Array.isArray(node?.icon?.imageAlts) ? node.icon.imageAlts : []),
+    node?.icon?.tooltip || "",
+  ].filter(Boolean).join(" | ");
   return {
     id: node?.atlasId || "",
     nodeId: node?.nodeId || "",
@@ -30,8 +35,8 @@ function asLegacyElement(node) {
     focused: Boolean(node?.focused),
     disabled: Boolean(node?.disabled),
     visibleName,
-    nearbyText: node?.description || "",
-    descriptor: [purposeForNode(node), sectionForNode(node), visibleName || node?.parentChain || ""]
+    nearbyText: node?.description || iconText || "",
+    descriptor: [purposeForNode(node), sectionForNode(node), visibleName || iconText || node?.parentChain || ""]
       .filter(Boolean)
       .join(" | "),
     href: node?.href || "",
@@ -39,6 +44,7 @@ function asLegacyElement(node) {
     inViewport: node?.inViewport,
     actionHints: node?.actionHints || [],
     parentChain: node?.parentChain || "",
+    icon: node?.icon || null,
   };
 }
 
@@ -132,6 +138,8 @@ function summarizeNode(node) {
     "dialogOwner",
     "parentChain",
     "actionHints",
+    "accessibility",
+    "icon",
   ]);
 }
 

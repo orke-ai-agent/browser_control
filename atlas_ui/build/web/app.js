@@ -213,6 +213,10 @@ function activeRunStatus(ticket) {
   return ticket?.lastRunStatus || "not started";
 }
 
+function isRunningStatus(status) {
+  return ["running", "submitted", "stopping"].includes(String(status || "").trim().toLowerCase());
+}
+
 function ticketRunHistory(ticket) {
   const source = Array.isArray(ticket?.runHistory) ? ticket.runHistory : [];
   const history = source
@@ -300,6 +304,16 @@ function buildTicketPrompt(ticket) {
   const fileLines = files.length
     ? files.map((file, index) => `${index + 1}. ${file.name} (${file.mimeType}, ${file.size} bytes)`).join("\n")
     : "No files in this ticket asset box.";
+  const attachmentRequirements = files.length
+    ? [
+        "Attachment execution requirements:",
+        files.length > 1
+          ? "- The task asset box contains multiple files. If the user asks to post, upload, attach, publish, or share these assets, use mediaRef all_media unless the page visibly rejects multiple attachments."
+          : "- The task asset box contains one file. If the user asks to post, upload, attach, publish, or share it, use that attached media through upload_media.",
+        "- Do not treat the file list as informational text only; it is the payload for upload_media when the task asks for files/media.",
+        "",
+      ]
+    : [];
 
   return [
     `Execute scheduled ticket: ${ticket.title || "Untitled Ticket"}`,
@@ -307,6 +321,7 @@ function buildTicketPrompt(ticket) {
     "Ticket asset box files:",
     fileLines,
     "",
+    ...attachmentRequirements,
     "Tasks:",
     steps || "1. No task description yet.",
   ].join("\n");
@@ -711,8 +726,19 @@ function renderRunWidget() {
   const runNow = document.createElement("button");
   runNow.className = "save-action";
   runNow.type = "button";
-  runNow.textContent = state.isStartingRun ? "Starting..." : "Run Now";
-  runNow.disabled = !ticket || state.isStartingRun || activeRunStatus(ticket) === "running";
+  const status = activeRunStatus(ticket);
+  const runIsActive = state.isStartingRun || isRunningStatus(state.activeThread?.status);
+  if (runIsActive) {
+    const spinner = document.createElement("span");
+    spinner.className = "run-spinner run-button-spinner";
+    spinner.setAttribute("aria-hidden", "true");
+    const label = document.createElement("span");
+    label.textContent = state.isStartingRun ? "Starting..." : "Running";
+    runNow.append(spinner, label);
+  } else {
+    runNow.textContent = "Run Now";
+  }
+  runNow.disabled = !ticket || runIsActive;
   runNow.addEventListener("click", () => runTicketNow(ticket.id));
   const refresh = document.createElement("button");
   refresh.className = "secondary-action";
@@ -725,13 +751,31 @@ function renderRunWidget() {
 
   const summary = document.createElement("div");
   summary.className = "run-summary-card";
-  const status = activeRunStatus(ticket);
   const cycle = Number(state.activeThread?.meta?.cycleCount || 0);
   const tokens = Number(state.activeThread?.meta?.totalTokens || 0);
   const latest = latestProgressMessage(state.activeThread);
-  summary.textContent = activeThreadId
-    ? `Thread ${activeThreadId} · ${status} · cycle ${cycle} · ${tokens} tokens · ${formatDateTime(ticket?.lastRunAt) || "no run time"}${latest ? `\n${sanitizeRunLogText(latest)}` : ""}`
-    : "No previous run yet.";
+  if (activeThreadId) {
+    const statusLine = document.createElement("div");
+    statusLine.className = `run-status-line${runIsActive ? " is-running" : ""}`;
+    if (runIsActive) {
+      const spinner = document.createElement("span");
+      spinner.className = "run-spinner";
+      spinner.setAttribute("aria-hidden", "true");
+      statusLine.append(spinner);
+    }
+    const statusText = document.createElement("span");
+    statusText.textContent = `Thread ${activeThreadId} · ${status} · cycle ${cycle} · ${tokens} tokens · ${formatDateTime(ticket?.lastRunAt) || "no run time"}`;
+    statusLine.append(statusText);
+    summary.append(statusLine);
+    if (latest) {
+      const latestLine = document.createElement("div");
+      latestLine.className = "run-latest";
+      latestLine.textContent = sanitizeRunLogText(latest);
+      summary.append(latestLine);
+    }
+  } else {
+    summary.textContent = "No previous run yet.";
+  }
   summaryWrap.append(summary);
   panel.append(summaryWrap);
 
@@ -748,9 +792,9 @@ function renderRunWidget() {
     return panel;
   }
 
-  [...messages].reverse().forEach((message) => {
+  [...messages].reverse().forEach((message, index) => {
     const item = document.createElement("article");
-    item.className = "run-message";
+    item.className = `run-message${runIsActive && index === 0 ? " is-current" : ""}`;
     const head = document.createElement("div");
     head.className = "run-message-head";
     const time = formatDateTime(message.timestamp);
@@ -929,6 +973,9 @@ async function refreshActiveRun(options = {}) {
   try {
     const payload = await requestJson(`/api/threads/${threadId}`);
     state.activeThread = payload.thread || null;
+    if (ticket && state.activeThread?.status) {
+      ticket.lastRunStatus = state.activeThread.status;
+    }
     logEvent("ticket_run_refreshed", {
       id: ticket.id,
       threadId,

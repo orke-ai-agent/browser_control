@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const { resolveNodeActionTarget } = require("./observation/node-resolver");
 
 function compact(value) {
   return String(value || "").trim().toLowerCase();
@@ -24,74 +25,6 @@ function targetNotFound(actionType, elementId, details = {}) {
 
 function actionElementId(action) {
   return String(action?.elementId || "").trim();
-}
-
-function actionNodeId(action) {
-  return String(action?.nodeId || "").trim();
-}
-
-function graphNodeById(pageGraph, nodeId) {
-  const targetId = String(nodeId || "").trim();
-  if (!targetId || !pageGraph) {
-    return null;
-  }
-  const buckets = [
-    pageGraph.interactive,
-    pageGraph.forms,
-    pageGraph.dialogs,
-    pageGraph.landmarks,
-    pageGraph.validationMessages,
-    pageGraph.media,
-    pageGraph.frames,
-    pageGraph.textBlocks,
-    pageGraph.activeElement ? [pageGraph.activeElement] : [],
-  ];
-  for (const bucket of buckets) {
-    for (const node of bucket || []) {
-      if (String(node?.nodeId || "").trim() === targetId) {
-        return node;
-      }
-    }
-  }
-  return null;
-}
-
-function nodeTargetError(code, message, action, nodeId, details = {}) {
-  const error = new Error(message);
-  error.name = "NodeTargetResolutionError";
-  error.code = code;
-  error.action = action;
-  error.nodeId = nodeId;
-  error.details = details;
-  return error;
-}
-
-function resolveNodeAction(action, observation) {
-  const nodeId = actionNodeId(action);
-  if (!nodeId || actionElementId(action)) {
-    return action;
-  }
-
-  const node = graphNodeById(observation?.pageGraph, nodeId);
-  if (!node) {
-    throw nodeTargetError("NODE_STALE", `AgentPageGraph node "${nodeId}" is no longer present.`, action, nodeId);
-  }
-  if (node.disabled) {
-    throw nodeTargetError("NODE_DISABLED", `AgentPageGraph node "${nodeId}" is disabled.`, action, nodeId);
-  }
-  if (node.visible === false) {
-    throw nodeTargetError("NODE_NOT_VISIBLE", `AgentPageGraph node "${nodeId}" is not visible.`, action, nodeId);
-  }
-  if (!node.atlasId) {
-    throw nodeTargetError("NODE_NOT_EXECUTABLE", `AgentPageGraph node "${nodeId}" has no executable atlas target.`, action, nodeId);
-  }
-
-  return {
-    ...action,
-    elementId: node.atlasId,
-    resolvedNodeId: nodeId,
-    targetReason: action.targetReason || `Resolved AgentPageGraph node ${nodeId}`,
-  };
 }
 
 function actionAccessibleTarget(action) {
@@ -348,6 +281,22 @@ async function clickAccessibleTarget({ canvas, logger, action, reason }) {
     return null;
   }
 
+  if (target.role === "generic") {
+    const textFallback = await clickTextTargetFallback({
+      canvas,
+      logger,
+      targetName: target.name,
+      reason: reason || "model-selected generic accessibility target",
+    });
+    if (textFallback) {
+      return {
+        ...textFallback,
+        role: target.role,
+        name: target.name,
+      };
+    }
+  }
+
   const locator = canvas.page.getByRole(target.role, {
     name: target.name,
     exact: true,
@@ -355,9 +304,20 @@ async function clickAccessibleTarget({ canvas, logger, action, reason }) {
   const visibleTarget = await pickVisibleLocatorClosestToObserved(locator, null);
   const targetLocator = visibleTarget || locator.first();
   if ((await locator.count().catch(() => 0)) <= 0) {
-    throw new Error(
-      `Accessible target role="${target.role}" name="${target.name}" was not found on the current page.`,
-    );
+    const textFallback = await clickTextTargetFallback({
+      canvas,
+      logger,
+      targetName: target.name,
+      reason: reason || `role=${target.role} name=${target.name} not found`,
+    });
+    if (textFallback) {
+      return {
+        ...textFallback,
+        role: target.role,
+        name: target.name,
+      };
+    }
+    throw new Error(`Accessible target role="${target.role}" name="${target.name}" was not found on the current page.`);
   }
 
   await canvas.click(targetLocator, {
@@ -375,6 +335,136 @@ async function clickAccessibleTarget({ canvas, logger, action, reason }) {
     role: target.role,
     name: target.name,
   };
+}
+
+async function clickTextTargetFallback({ canvas, logger, targetName, reason }) {
+  const name = textValue(targetName);
+  if (!name) {
+    return null;
+  }
+
+  try {
+    const exactLocator = canvas.page.getByText(name, { exact: true });
+    const exactTarget = await pickVisibleLocatorClosestToObserved(exactLocator, null);
+    if (exactTarget) {
+      await canvas.click(exactTarget, {
+        note: reason || `text=${name}`,
+        timeout: 5000,
+      });
+      logger.event("agent.executor", "click_text_fallback_succeeded", {
+        method: "playwright_text_exact",
+        name,
+        reason: reason || "",
+      });
+      return {
+        method: "playwright_text_exact",
+        name,
+      };
+    }
+  } catch (error) {
+    logger.warn("agent.executor", "click_text_exact_fallback_failed", {
+      name,
+      reason: reason || "",
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  const result = await canvas.page.evaluate((targetText) => {
+    const needle = String(targetText || "").trim().toLowerCase();
+    if (!needle) {
+      return null;
+    }
+
+    function isVisible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return (
+        rect.width > 1 &&
+        rect.height > 1 &&
+        style.visibility !== "hidden" &&
+        style.display !== "none" &&
+        Number(style.opacity || 1) > 0
+      );
+    }
+
+    function scoreElement(element) {
+      const text = String(element.innerText || element.textContent || "").trim();
+      const label = String(
+        element.getAttribute("aria-label") ||
+          element.getAttribute("title") ||
+          element.getAttribute("placeholder") ||
+          "",
+      ).trim();
+      const haystack = `${label} ${text}`.trim().toLowerCase();
+      if (!haystack) {
+        return 0;
+      }
+      if (haystack === needle) {
+        return 100;
+      }
+      if (haystack.includes(needle)) {
+        return 80;
+      }
+      if (needle.includes(haystack) && haystack.length >= 8) {
+        return 60;
+      }
+      return 0;
+    }
+
+    const candidates = Array.from(document.querySelectorAll("button, a, input, textarea, [role], [contenteditable], div, span"))
+      .filter(isVisible)
+      .map((element) => ({
+        element,
+        score: scoreElement(element),
+        rect: element.getBoundingClientRect(),
+      }))
+      .filter((item) => item.score > 0)
+      .sort((left, right) => {
+        if (right.score !== left.score) {
+          return right.score - left.score;
+        }
+        return (left.rect.width * left.rect.height) - (right.rect.width * right.rect.height);
+      });
+
+    const match = candidates[0];
+    if (!match) {
+      return null;
+    }
+
+    const rect = match.rect;
+    match.element.click();
+    return {
+      tag: match.element.tagName.toLowerCase(),
+      role: match.element.getAttribute("role") || "",
+      text: String(match.element.innerText || match.element.textContent || "").trim().slice(0, 180),
+      x: Math.round(rect.left + rect.width / 2),
+      y: Math.round(rect.top + rect.height / 2),
+      score: match.score,
+    };
+  }, name).catch((error) => ({
+    error: error instanceof Error ? error.message : String(error),
+  }));
+
+  if (result && !result.error) {
+    logger.event("agent.executor", "click_text_fallback_succeeded", {
+      method: "dom_text_match",
+      name,
+      result,
+      reason: reason || "",
+    });
+    return {
+      method: "dom_text_match",
+      name,
+      result,
+    };
+  }
+
+  logger.warn("agent.executor", "click_text_fallback_failed", {
+    name,
+    reason: reason || "",
+    error: result?.error || "no matching visible text target",
+  });
+  return null;
 }
 
 
@@ -879,7 +969,7 @@ async function uploadViaRuntime({ canvas, logger, resolvedElement, elementId, fi
 }
 
 async function executeAction({ action, canvas, observation, logger }) {
-  action = resolveNodeAction(action, observation);
+  action = resolveNodeActionTarget(action, observation);
   logger.event("agent.executor", "action_start", { action });
 
   switch (action.type) {

@@ -547,12 +547,23 @@ function buildTicketPrompt(ticket) {
   const fileLines = files.length
     ? files.map((file, index) => `${index + 1}. ${file.name} (${file.mimeType}, ${file.size} bytes)`).join("\n")
     : "No files in this ticket asset box.";
+  const attachmentRequirements = files.length
+    ? [
+        "Attachment execution requirements:",
+        files.length > 1
+          ? "- The task asset box contains multiple files. If the user asks to post, upload, attach, publish, or share these assets, use mediaRef all_media unless the page visibly rejects multiple attachments."
+          : "- The task asset box contains one file. If the user asks to post, upload, attach, publish, or share it, use that attached media through upload_media.",
+        "- Do not treat the file list as informational text only; it is the payload for upload_media when the task asks for files/media.",
+        "",
+      ]
+    : [];
   return [
     `Execute scheduled ticket: ${ticket.title}`,
     "",
     "Ticket asset box files:",
     fileLines,
     "",
+    ...attachmentRequirements,
     "Tasks:",
     steps,
   ].join("\n");

@@ -8,6 +8,8 @@
   --board: #e9dfcb;
   --accent: #186f65;
   --accent-strong: #0f514a;
+  --active: #2f6df6;
+  --active-soft: rgba(47, 109, 246, 0.14);
   --danger: #9d2d24;
   --shadow: 0 18px 45px rgba(42, 32, 17, 0.15);
 }
@@ -443,6 +445,13 @@ textarea.text-field {
   justify-content: flex-end;
 }
 
+.run-actions .save-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+}
+
 .run-summary-card,
 .run-message {
   border: 1px solid rgba(86, 71, 44, 0.18);
@@ -450,6 +459,48 @@ textarea.text-field {
   background: rgba(255, 255, 255, 0.68);
   padding: 14px;
   white-space: pre-wrap;
+}
+
+.run-summary-card:has(.run-status-line.is-running),
+.run-message.is-current {
+  border-color: rgba(47, 109, 246, 0.58);
+  background: linear-gradient(90deg, rgba(47, 109, 246, 0.1), rgba(255, 255, 255, 0.72));
+  box-shadow: inset 3px 0 0 var(--active);
+}
+
+.run-status-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 760;
+}
+
+.run-status-line span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-latest {
+  margin-top: 8px;
+}
+
+.run-spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  border: 2px solid rgba(47, 109, 246, 0.22);
+  border-top-color: var(--active);
+  border-radius: 50%;
+  animation: spin 760ms linear infinite;
+}
+
+.run-button-spinner {
+  border-color: rgba(255, 255, 255, 0.28);
+  border-top-color: #fff;
 }
 
 .run-messages {
@@ -618,6 +669,12 @@ textarea.text-field {
 .run-history-item.is-active {
   border-color: rgba(24, 111, 101, 0.55);
   box-shadow: inset 3px 0 0 var(--accent);
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .run-history-title,

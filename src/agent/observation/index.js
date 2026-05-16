@@ -1,7 +1,20 @@
-const { roles } = require("aria-query");
+const { elementRoles, roles } = require("aria-query");
 const { emptyAgentPageGraph } = require("./schema");
 
 const KNOWN_ARIA_ROLES = new Set([...roles.keys()]);
+const IMPLICIT_ROLE_RULES = [...elementRoles.entries()]
+  .map(([schema, roleSet]) => ({
+    name: schema.name,
+    attributes: Array.isArray(schema.attributes)
+      ? schema.attributes.map((attribute) => ({
+          name: attribute.name,
+          value: attribute.value,
+          constraints: attribute.constraints || [],
+        }))
+      : [],
+    roles: [...roleSet],
+  }))
+  .filter((entry) => entry.name && entry.roles.length);
 
 function clampText(value, limit = 240) {
   return String(value || "").replace(/\s+/g, " ").trim().slice(0, limit);
@@ -76,8 +89,9 @@ function summarizeGraph(graph) {
 }
 
 async function collectDomGraph(page) {
-  return page.evaluate(({ knownRoles }) => {
+  return page.evaluate(({ knownRoles, implicitRoleRules }) => {
     const knownRoleSet = new Set(knownRoles || []);
+    const roleRules = Array.isArray(implicitRoleRules) ? implicitRoleRules : [];
 
     function compact(value, limit = 240) {
       return String(value || "").replace(/\s+/g, " ").trim().slice(0, limit);
@@ -128,9 +142,32 @@ async function collectDomGraph(page) {
       return knownRoleSet.has(role) ? role : "";
     }
 
+    function roleSourceFor(element) {
+      return explicitRole(element) ? "explicit" : implicitRole(element) ? "implicit" : "none";
+    }
+
     function implicitRole(element) {
       const tag = element.tagName.toLowerCase();
       const type = String(element.getAttribute("type") || "").toLowerCase();
+      for (const rule of roleRules) {
+        if (rule.name !== tag) {
+          continue;
+        }
+        const attributes = Array.isArray(rule.attributes) ? rule.attributes : [];
+        const matches = attributes.every((attribute) => {
+          if (!attribute?.name) {
+            return true;
+          }
+          const actual = element.getAttribute(attribute.name);
+          if (attribute.value === undefined || attribute.value === null) {
+            return actual !== null;
+          }
+          return String(actual || "").toLowerCase() === String(attribute.value || "").toLowerCase();
+        });
+        if (matches && Array.isArray(rule.roles) && rule.roles.length) {
+          return rule.roles[0];
+        }
+      }
       if (tag === "a" && element.hasAttribute("href")) return "link";
       if (tag === "button") return "button";
       if (tag === "textarea") return "textbox";
@@ -168,6 +205,13 @@ async function collectDomGraph(page) {
     }
 
     function labelFor(element) {
+      const nativeLabels = Array.from(element.labels || [])
+        .map((label) => compact(label.innerText || label.textContent, 240))
+        .filter(Boolean);
+      if (nativeLabels.length) {
+        return nativeLabels.join(" ").slice(0, 240);
+      }
+
       const id = element.getAttribute("id") || "";
       if (id) {
         const label = document.querySelector(`label[for="${CSS.escape(id)}"]`);
@@ -177,20 +221,105 @@ async function collectDomGraph(page) {
       return closestLabel ? compact(closestLabel.innerText || closestLabel.textContent, 240) : "";
     }
 
+    function nameDetailsFor(element) {
+      const candidates = [
+        ["aria-label", compact(element.getAttribute("aria-label"), 240)],
+        ["aria-labelledby", textByIdList(element.getAttribute("aria-labelledby"))],
+        ["label", labelFor(element)],
+        ["placeholder", compact(element.getAttribute("placeholder"), 240)],
+        ["alt", compact(element.getAttribute("alt"), 240)],
+        ["title", compact(element.getAttribute("title"), 240)],
+        ["contents", compact(element.innerText || element.textContent, 240)],
+      ];
+
+      for (const [source, value] of candidates) {
+        if (value) {
+          return { value, source };
+        }
+      }
+
+      return { value: "", source: "none" };
+    }
+
     function nameFor(element) {
-      return (
-        compact(element.getAttribute("aria-label"), 240) ||
-        textByIdList(element.getAttribute("aria-labelledby")) ||
-        labelFor(element) ||
-        compact(element.getAttribute("placeholder"), 240) ||
-        compact(element.getAttribute("alt"), 240) ||
-        compact(element.getAttribute("title"), 240) ||
-        compact(element.innerText || element.textContent, 240)
-      );
+      return nameDetailsFor(element).value;
+    }
+
+    function descriptionDetailsFor(element) {
+      const describedBy = textByIdList(element.getAttribute("aria-describedby"));
+      if (describedBy) {
+        return { value: describedBy, source: "aria-describedby" };
+      }
+      const title = compact(element.getAttribute("title"), 240);
+      if (title && title !== nameFor(element)) {
+        return { value: title, source: "title" };
+      }
+      return { value: "", source: "none" };
     }
 
     function descriptionFor(element) {
-      return textByIdList(element.getAttribute("aria-describedby"));
+      return descriptionDetailsFor(element).value;
+    }
+
+    function accessibilityFor(element) {
+      const name = nameDetailsFor(element);
+      const description = descriptionDetailsFor(element);
+      return {
+        roleSource: roleSourceFor(element),
+        nameSource: name.source,
+        descriptionSource: description.source,
+        labelledBy: compact(element.getAttribute("aria-labelledby"), 240),
+        describedBy: compact(element.getAttribute("aria-describedby"), 240),
+        labelText: labelFor(element),
+      };
+    }
+
+    function tokenListFor(value, limit = 8) {
+      return String(value || "")
+        .split(" ")
+        .map((item) => compact(item, 60))
+        .filter(Boolean)
+        .slice(0, limit);
+    }
+
+    function iconSummaryFor(element) {
+      const graphics = Array.from(element.querySelectorAll("svg, img, [role='img'], use"))
+        .slice(0, 8);
+      const svgTitles = [];
+      const imageAlts = [];
+      const symbolRefs = [];
+      for (const graphic of graphics) {
+        const tag = graphic.tagName.toLowerCase();
+        const title = graphic.querySelector?.("title")?.textContent || graphic.getAttribute("title") || "";
+        const label = graphic.getAttribute("aria-label") || "";
+        const alt = graphic.getAttribute("alt") || "";
+        const href = graphic.getAttribute("href") || graphic.getAttribute("xlink:href") || "";
+        if (title || label) svgTitles.push(compact(title || label, 120));
+        if (tag === "img" && alt) imageAlts.push(compact(alt, 120));
+        if (href) symbolRefs.push(compact(href, 160));
+      }
+
+      const tooltip = (
+        element.getAttribute("data-tooltip") ||
+        element.getAttribute("data-tooltip-content") ||
+        element.getAttribute("data-testid") ||
+        element.getAttribute("data-test-id") ||
+        element.getAttribute("title") ||
+        ""
+      );
+      const classTokens = graphics.length ? tokenListFor(element.getAttribute("class")) : [];
+      if (!graphics.length && !tooltip) {
+        return null;
+      }
+
+      return {
+        graphicsCount: graphics.length,
+        svgTitles: svgTitles.filter(Boolean).slice(0, 4),
+        imageAlts: imageAlts.filter(Boolean).slice(0, 4),
+        symbolRefs: symbolRefs.filter(Boolean).slice(0, 4),
+        tooltip: compact(tooltip, 160),
+        classTokens,
+      };
     }
 
     function nodePath(element) {
@@ -219,6 +348,8 @@ async function collectDomGraph(page) {
         role: roleFor(element),
         name: nameFor(element),
         description: descriptionFor(element),
+        accessibility: accessibilityFor(element),
+        icon: iconSummaryFor(element),
         text: compact(element.innerText || element.textContent, 320),
         value: compact(element.value, 240),
         placeholder: compact(element.getAttribute("placeholder"), 240),
@@ -381,7 +512,10 @@ async function collectDomGraph(page) {
       frames,
       diagnostics: [],
     };
-  }, { knownRoles: [...KNOWN_ARIA_ROLES] });
+  }, {
+    knownRoles: [...KNOWN_ARIA_ROLES],
+    implicitRoleRules: IMPLICIT_ROLE_RULES,
+  });
 }
 
 async function observePageGraph({ canvas, threadId, logger, screenshotPath = "" }) {

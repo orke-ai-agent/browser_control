@@ -1,12 +1,67 @@
 const fs = require("fs");
 const path = require("path");
 const {
-  compact,
-  familyToIntent,
-  inferFlowProfile,
-  sanitizeSegment,
-  inferActionFamilyFromAction,
-} = require("./semantic");
+  actionFamilyFromAction,
+  graphFlowSignature,
+} = require("./observation/routing");
+
+function compact(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function sanitizeSegment(value, fallback = "generic") {
+  const normalized = compact(value).replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  return normalized || fallback;
+}
+
+function hostFromObservation(observation) {
+  try {
+    return new URL(String(observation?.pageGraph?.page?.url || observation?.page?.url || "")).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function buildFlowProfile(observation) {
+  const graph = observation?.pageGraph || {};
+  const modality = graph.modality || {};
+  const host = hostFromObservation(observation);
+  const tokens = [
+    host ? `host_${sanitizeSegment(host)}` : "host_unknown",
+    modality.kind ? `modality_${sanitizeSegment(modality.kind)}` : "modality_unknown",
+    modality.domQuality ? `dom_${sanitizeSegment(modality.domQuality)}` : "",
+    modality.ariaQuality ? `aria_${sanitizeSegment(modality.ariaQuality)}` : "",
+    Array.isArray(graph.dialogs) && graph.dialogs.length ? "dialog_open" : "dialog_closed",
+    Array.isArray(graph.forms) && graph.forms.length ? "forms_present" : "forms_absent",
+    graph.activeElement?.nodeId ? "focus_active" : "focus_none",
+  ].filter(Boolean);
+
+  return {
+    host,
+    site: host || "unknown",
+    flowKey: graphFlowSignature(observation),
+    flowTokens: tokens,
+    pageKind: modality.kind || "unknown",
+  };
+}
+
+function flowTokensFor(flowProfile) {
+  if (Array.isArray(flowProfile?.flowTokens)) {
+    return flowProfile.flowTokens;
+  }
+  if (Array.isArray(flowProfile?.tokens)) {
+    return flowProfile.tokens;
+  }
+  return [];
+}
+
+function familyToIntent(actionFamily) {
+  if (actionFamily === "text_input") return "fill_input";
+  if (actionFamily === "click") return "click_primary";
+  if (actionFamily === "navigation") return "navigate";
+  if (actionFamily === "upload") return "upload";
+  return "generic";
+}
 
 function ensureDirectory(directoryPath) {
   fs.mkdirSync(directoryPath, { recursive: true });
@@ -118,6 +173,7 @@ function summarizeRecipe(recipe) {
 
 function overlapScore(recipe, flowProfile, actionFamily) {
   let score = 0;
+  const flowTokens = flowTokensFor(flowProfile);
 
   if (recipe.host && recipe.host === flowProfile.host) {
     score += 40;
@@ -134,13 +190,13 @@ function overlapScore(recipe, flowProfile, actionFamily) {
   }
 
   const recipeTokens = new Set(recipe.flowTokens || []);
-  for (const token of flowProfile.tokens) {
+  for (const token of flowTokens) {
     if (recipeTokens.has(token)) {
       score += 6;
     }
   }
 
-  if (recipe.targetHints?.section && flowProfile.tokens.includes(`section_${sanitizeSegment(recipe.targetHints.section)}`)) {
+  if (recipe.targetHints?.section && flowTokens.includes(`section_${sanitizeSegment(recipe.targetHints.section)}`)) {
     score += 4;
   }
 
@@ -176,7 +232,7 @@ function createShortcutMemory({ filePath, logger }) {
 
   function retrieve({ observation, actionFamily, limit = 3 }) {
     const state = loadState();
-    const flowProfile = inferFlowProfile(observation);
+    const flowProfile = buildFlowProfile(observation);
 
     return state.recipes
       .filter((recipe) => !recipe.disabled)
@@ -196,13 +252,13 @@ function createShortcutMemory({ filePath, logger }) {
   }
 
   function upsertFromAction({ observation, action, resolvedTarget, origin = "learned" }) {
-    const actionFamily = inferActionFamilyFromAction(action);
+    const actionFamily = actionFamilyFromAction(action);
 
     if (!["click", "text_input", "navigation"].includes(actionFamily)) {
       return null;
     }
 
-    const flowProfile = inferFlowProfile(observation);
+    const flowProfile = buildFlowProfile(observation);
     const targetHints = buildTargetHints(action, resolvedTarget);
 
     if (flowProfile.site === "unknown") {
@@ -228,7 +284,7 @@ function createShortcutMemory({ filePath, logger }) {
       existing.lastObservedAt = currentTime;
       existing.disabled = false;
       existing.origin = existing.origin || origin;
-      existing.flowTokens = flowProfile.tokens;
+      existing.flowTokens = flowTokensFor(flowProfile);
       existing.targetHints = {
         ...existing.targetHints,
         ...targetHints,
@@ -248,10 +304,10 @@ function createShortcutMemory({ filePath, logger }) {
       site: flowProfile.site,
       host: flowProfile.host,
       flowKey: flowProfile.flowKey,
-      flowTokens: flowProfile.tokens,
+      flowTokens: flowTokensFor(flowProfile),
       pageKind: flowProfile.pageKind,
       actionFamily,
-      intent: familyToIntent(actionFamily, observation),
+      intent: familyToIntent(actionFamily),
       origin,
       actionTemplate: {
         type: action.type,
