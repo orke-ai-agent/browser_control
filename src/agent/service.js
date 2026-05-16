@@ -25,7 +25,13 @@ const GEMINI_503_BACKOFF_MS = 1500;
 const MAX_GEMINI_503_RUN_PAUSES = 8;
 const GEMINI_503_RUN_BACKOFF_BASE_MS = 15000;
 const GEMINI_503_RUN_BACKOFF_MAX_MS = 300000;
+const GEMINI_429_RUN_BACKOFF_BASE_MS = 30000;
+const GEMINI_429_RUN_BACKOFF_MAX_MS = 600000;
 const ESSENTIAL_RUN_EVENTS = new Set([
+  "queue_enqueue",
+  "queue_turn_started",
+  "queue_turn_finished",
+  "queue_turn_requeued",
   "run_started",
   "block_planned",
   "action_target_model_resolved",
@@ -43,6 +49,7 @@ const ESSENTIAL_RUN_EVENTS = new Set([
   "gemini_503_retry_exhausted",
   "gemini_503_run_paused",
   "gemini_503_run_resume_scheduled",
+  "gemini_429_run_paused",
   "run_failed",
   "run_finished",
 ]);
@@ -227,9 +234,18 @@ function isGemini503Error(error) {
   return Number(error?.status || 0) === 503;
 }
 
+function isGemini429Error(error) {
+  return Number(error?.status || 0) === 429;
+}
+
 function gemini503RunBackoffMs(pauseCount) {
   const exponent = Math.max(0, Number(pauseCount || 1) - 1);
   return Math.min(GEMINI_503_RUN_BACKOFF_MAX_MS, GEMINI_503_RUN_BACKOFF_BASE_MS * (2 ** exponent));
+}
+
+function gemini429RunBackoffMs(pauseCount) {
+  const exponent = Math.max(0, Number(pauseCount || 1) - 1);
+  return Math.min(GEMINI_429_RUN_BACKOFF_MAX_MS, GEMINI_429_RUN_BACKOFF_BASE_MS * (2 ** exponent));
 }
 
 function gemini503StepBackoffMs(attempt) {
@@ -245,6 +261,11 @@ function buildGemini503StopMessage(task) {
 function buildGemini503PauseMessage(task, resumeAt) {
   const taskLabel = String(task || "step").trim() || "step";
   return `Gemini is overloaded during ${taskLabel}. I paused this run and will retry automatically at ${resumeAt}.`;
+}
+
+function buildGemini429PauseMessage(task, resumeAt) {
+  const taskLabel = String(task || "step").trim() || "step";
+  return `Gemini rate limited this run during ${taskLabel}. I paused it and will retry automatically at ${resumeAt}.`;
 }
 
 function collectUsedShortcuts(actions, retrievedShortcuts) {
@@ -1197,7 +1218,169 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
     logger,
   });
   const runtimes = new Map();
+  const queueItems = [];
+  const queuedThreadIds = new Set();
+  let queueWorkerRunning = false;
   let sharedSessionPromise = null;
+  const queueTurnBudget = Math.max(1, Math.min(3, Number(env.AGENT_QUEUE_TURN_BUDGET || process.env.AGENT_QUEUE_TURN_BUDGET || 1)));
+
+  function activeQueueItemCount() {
+    return queueItems.length + (queueWorkerRunning ? 1 : 0);
+  }
+
+  function enqueueAgentTurn(threadId, userGoal, options = {}) {
+    const normalizedThreadId = String(threadId || "").trim();
+    const normalizedGoal = String(userGoal || "").trim();
+    if (!normalizedThreadId || !normalizedGoal) {
+      return;
+    }
+
+    if (queuedThreadIds.has(normalizedThreadId)) {
+      logger.event("agent.queue", "queue_enqueue_skipped_duplicate", {
+        threadId: normalizedThreadId,
+        queueSize: queueItems.length,
+      });
+      return;
+    }
+
+    const notBefore = Number(options.notBefore || 0) || 0;
+    const queueRunId = String(options.queueRunId || `queue-${normalizedThreadId}-${Date.now().toString(36)}`).trim();
+    const turnIndex = Math.max(1, Number(options.turnIndex || 1));
+    queueItems.push({
+      threadId: normalizedThreadId,
+      userGoal: normalizedGoal,
+      enqueuedAt: Date.now(),
+      notBefore,
+      queueRunId,
+      turnIndex,
+      turnBudget: Math.max(1, Math.min(3, Number(options.turnBudget || queueTurnBudget))),
+    });
+    queuedThreadIds.add(normalizedThreadId);
+    const thread = store.getThread(normalizedThreadId);
+    if (thread && !["running", "stopping"].includes(String(thread.status || ""))) {
+      store.setStatus(normalizedThreadId, "submitted");
+    }
+    logger.event("agent.queue", "queue_enqueue", {
+      threadId: normalizedThreadId,
+      queueSize: queueItems.length,
+      activeCount: activeQueueItemCount(),
+      notBefore,
+      queueRunId,
+      turnIndex,
+    });
+    scheduleQueueWorker();
+  }
+
+  function scheduleQueueWorker() {
+    if (queueWorkerRunning) {
+      return;
+    }
+
+    setTimeout(() => {
+      processQueue().catch((error) => {
+        queueWorkerRunning = false;
+        logger.error("agent.queue", "queue_worker_failed", error);
+        if (queueItems.length) {
+          scheduleQueueWorker();
+        }
+      });
+    }, 0);
+  }
+
+  function nextReadyQueueItem() {
+    const now = Date.now();
+    let soonest = 0;
+
+    for (let index = 0; index < queueItems.length; index += 1) {
+      const item = queueItems[index];
+      if (!item.notBefore || item.notBefore <= now) {
+        queueItems.splice(index, 1);
+        queuedThreadIds.delete(item.threadId);
+        return {
+          item,
+          waitMs: 0,
+        };
+      }
+
+      soonest = soonest ? Math.min(soonest, item.notBefore) : item.notBefore;
+    }
+
+    return {
+      item: null,
+      waitMs: soonest ? Math.max(50, soonest - now) : 0,
+    };
+  }
+
+  async function processQueue() {
+    if (queueWorkerRunning) {
+      return;
+    }
+
+    queueWorkerRunning = true;
+    try {
+      while (queueItems.length) {
+        const { item, waitMs } = nextReadyQueueItem();
+        if (!item) {
+          await wait(waitMs);
+          continue;
+        }
+
+        const thread = store.getThread(item.threadId);
+        if (!thread || thread.status === "stopping") {
+          logger.event("agent.queue", "queue_turn_skipped", {
+            threadId: item.threadId,
+            reason: thread ? "stopping" : "missing_thread",
+          });
+          continue;
+        }
+
+        logger.event("agent.queue", "queue_turn_started", {
+          threadId: item.threadId,
+          queueSize: queueItems.length,
+          turnBudget: item.turnBudget,
+          queueRunId: item.queueRunId,
+          turnIndex: item.turnIndex,
+        });
+
+        const outcome = await runLoop(item.threadId, item.userGoal, {
+          queueManaged: true,
+          turnBudget: item.turnBudget,
+          queueRunId: item.queueRunId,
+          turnIndex: item.turnIndex,
+        });
+
+        logger.event("agent.queue", "queue_turn_finished", {
+          threadId: item.threadId,
+          status: outcome?.status || "unknown",
+          shouldRequeue: Boolean(outcome?.shouldRequeue),
+          waitMs: Number(outcome?.waitMs || 0),
+          queueRunId: item.queueRunId,
+          turnIndex: item.turnIndex,
+        });
+
+        if (outcome?.shouldRequeue) {
+          enqueueAgentTurn(item.threadId, item.userGoal, {
+            notBefore: Date.now() + Number(outcome.waitMs || 0),
+            turnBudget: item.turnBudget,
+            queueRunId: item.queueRunId,
+            turnIndex: item.turnIndex + 1,
+          });
+          logger.event("agent.queue", "queue_turn_requeued", {
+            threadId: item.threadId,
+            queueSize: queueItems.length,
+            waitMs: Number(outcome.waitMs || 0),
+            queueRunId: item.queueRunId,
+            nextTurnIndex: item.turnIndex + 1,
+          });
+        }
+      }
+    } finally {
+      queueWorkerRunning = false;
+      if (queueItems.length) {
+        scheduleQueueWorker();
+      }
+    }
+  }
 
   async function ensureSharedSession() {
     if (sharedSessionPromise) {
@@ -1396,11 +1579,26 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
     return runtime.stopRequested;
   }
 
-  async function runLoop(threadId, userGoal) {
+  async function runLoop(threadId, userGoal, options = {}) {
     const runtime = await ensureRuntime(threadId);
-    const responseLanguage = inferResponseLanguage(userGoal);
-    const threadConfig = store.getThread(threadId)?.meta || {};
+    const queueManaged = Boolean(options.queueManaged);
+    const threadAtRunStart = store.getThread(threadId);
+    const threadConfig = threadAtRunStart?.meta || {};
+    const existingActiveGoal = String(threadConfig.activeUserGoal || "").trim();
+    const isContinuation = queueManaged && existingActiveGoal === String(userGoal || "").trim() && Number(threadConfig.cycleCount || 0) > 0;
+    const responseLanguage = threadConfig.responseLanguage || inferResponseLanguage(userGoal);
     const stepLimit = Math.max(1, Math.min(12, Number(threadConfig.stepLimit || DEFAULT_STEP_LIMIT)));
+    const turnBudget = Math.max(1, Math.min(stepLimit, Number(options.turnBudget || stepLimit)));
+    const maxActionsPerTurn = queueManaged ? 1 : 3;
+    const queueRunId = String(options.queueRunId || threadConfig.queueRunId || "").trim();
+    const turnIndex = Math.max(1, Number(options.turnIndex || threadConfig.queueTurnIndex || 1));
+    const startCycle = isContinuation ? Number(threadConfig.cycleCount || 0) + 1 : 1;
+    const endCycle = Math.min(stepLimit, startCycle + turnBudget - 1);
+    const runOutcome = {
+      status: "continue",
+      shouldRequeue: queueManaged,
+      waitMs: 0,
+    };
 
     if (runtime.running) {
       runtime.pendingGoals.push(userGoal);
@@ -1408,18 +1606,35 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
         threadId,
         pendingCount: runtime.pendingGoals.length,
       });
-      return;
+      return {
+        status: "queued_while_running",
+        shouldRequeue: false,
+        waitMs: 0,
+      };
+    }
+
+    if (startCycle > stepLimit) {
+      store.setStatus(threadId, "idle");
+      return {
+        status: "step_limit_reached",
+        shouldRequeue: false,
+        waitMs: 0,
+      };
     }
 
     runtime.running = true;
     runtime.stopRequested = false;
-    runtime.recoveryAttempts = 0;
+    runtime.recoveryAttempts = isContinuation
+      ? Number(threadConfig.recoveryAttempts || runtime.recoveryAttempts || 0)
+      : 0;
     const runId = `run-${threadId}-${Date.now().toString(36)}`;
     const runLogger = logger.fork({
       filePath: path.join(process.cwd(), "logs", `${runId}-${formatRunStamp()}.jsonl`),
       bindings: {
         threadId,
         runId,
+        queueRunId,
+        turnIndex,
       },
       shouldWrite(entry) {
         return entry.level !== "info" || ESSENTIAL_RUN_EVENTS.has(String(entry.event || "").trim());
@@ -1428,8 +1643,16 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
     store.setStatus(threadId, "running");
     runLogger.event("agent.service", "run_started", {
       userGoal,
+      queueManaged,
+      turnBudget,
+      startCycle,
+      endCycle,
+      isContinuation,
+      queueRunId,
+      turnIndex,
     });
     let gemini503ResumeDelayMs = 0;
+    let gemini429ResumeDelayMs = 0;
     const threadAtStart = store.getThread(threadId);
     const preservedSessionMemory = (threadAtStart?.meta?.sessionMemory || []).filter((entry) => {
       const key = String(entry?.key || "").trim();
@@ -1499,19 +1722,32 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
         replace: true,
       },
     ]);
-    store.updateMeta(threadId, {
-      cycleCount: 0,
-      geminiRequestCount: 0,
-      responseLanguage,
-      lastRunError: "",
-      sessionMemory: initialSessionMemory,
-    });
+    if (isContinuation) {
+      store.updateMeta(threadId, {
+        responseLanguage,
+        activeUserGoal: userGoal,
+        queueRunId,
+        queueTurnIndex: turnIndex,
+      });
+    } else {
+      store.updateMeta(threadId, {
+        cycleCount: 0,
+        geminiRequestCount: 0,
+        responseLanguage,
+        activeUserGoal: userGoal,
+        queueRunId,
+        queueTurnIndex: turnIndex,
+        lastRunError: "",
+        lastAnalysis: null,
+        sessionMemory: initialSessionMemory,
+      });
+    }
 
     try {
-      let priorAnalysis = null;
-      let lastError = "";
+      let priorAnalysis = isContinuation ? threadConfig.lastAnalysis || null : null;
+      let lastError = isContinuation ? String(threadConfig.lastRunError || "") : "";
 
-      for (let cycle = 1; cycle <= stepLimit; cycle += 1) {
+      for (let cycle = startCycle; cycle <= endCycle; cycle += 1) {
         if (shouldStop(runtime)) {
           addAssistantMessage(
             threadId,
@@ -1580,7 +1816,7 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
         });
         let plan = planResult.plan;
         let planUsage = planResult.planUsage || emptyUsage();
-        let actions = (Array.isArray(plan.actions) ? plan.actions.slice(0, 3) : []).map((action) => ({
+        let actions = (Array.isArray(plan.actions) ? plan.actions.slice(0, maxActionsPerTurn) : []).map((action) => ({
           ...action,
           shortcutKey: sanitizeShortcutKey(
             action.shortcutKey,
@@ -1623,7 +1859,7 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
           planResult = scrollLoopRetry;
           plan = scrollLoopRetry.plan || plan;
           planUsage = mergeUsage(planUsage, scrollLoopRetry.planUsage || emptyUsage());
-          actions = (Array.isArray(plan.actions) ? plan.actions.slice(0, 3) : [])
+          actions = (Array.isArray(plan.actions) ? plan.actions.slice(0, maxActionsPerTurn) : [])
             .map((action) => ({
               ...action,
               shortcutKey: "",
@@ -1666,7 +1902,7 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
           planResult = guardedRetry;
           plan = guardedRetry.plan || plan;
           planUsage = mergeUsage(planUsage, guardedRetry.planUsage || emptyUsage());
-          actions = (Array.isArray(plan.actions) ? plan.actions.slice(0, 3) : [])
+          actions = (Array.isArray(plan.actions) ? plan.actions.slice(0, maxActionsPerTurn) : [])
             .map((action) => ({
               ...action,
               shortcutKey: sanitizeShortcutKey(
@@ -1704,7 +1940,7 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
             planResult = recoveryRetry;
             plan = recoveryRetry.plan || plan;
             planUsage = mergeUsage(planUsage, recoveryRetry.planUsage || emptyUsage());
-            actions = (Array.isArray(plan.actions) ? plan.actions.slice(0, 3) : [])
+            actions = (Array.isArray(plan.actions) ? plan.actions.slice(0, maxActionsPerTurn) : [])
               .map((action) => ({
                 ...action,
                 shortcutKey: "",
@@ -1773,6 +2009,8 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
               recoveryAttempts: runtime.recoveryAttempts,
             },
           );
+          runOutcome.status = "failed";
+          runOutcome.shouldRequeue = false;
           break;
         }
 
@@ -2023,6 +2261,10 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
             executionJournal: nextExecutionJournal,
           });
         }
+        store.updateMeta(threadId, {
+          lastAnalysis: analysis,
+          recoveryAttempts: runtime.recoveryAttempts,
+        });
 
         const learnedShortcuts = [];
         if (shortcutMemory && !blockError && !shortcutMismatch) {
@@ -2046,6 +2288,8 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
         const blockStatus = blockError ? "failed" : "completed";
         appendBlockMessage(threadId, {
           cycle,
+          queueRunId,
+          turnIndex,
           kind: "block",
           status: blockStatus,
           comment:
@@ -2113,6 +2357,8 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
         if (analysis.taskComplete) {
           store.updateMeta(threadId, {
             lastRunError: "",
+            activeUserGoal: "",
+            lastAnalysis: analysis,
           });
           addAssistantMessage(
             threadId,
@@ -2127,6 +2373,8 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
               phase: "done",
             },
           );
+          runOutcome.status = "done";
+          runOutcome.shouldRequeue = false;
           break;
         }
 
@@ -2148,6 +2396,7 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
           });
           store.updateMeta(threadId, {
             lastRunError: lastError,
+            recoveryAttempts: runtime.recoveryAttempts,
           });
           continue;
         }
@@ -2171,6 +2420,7 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
             ].filter(Boolean).join("\n");
             store.updateMeta(threadId, {
               lastRunError: recoveryReport,
+              recoveryAttempts: runtime.recoveryAttempts,
             });
             addAssistantMessage(
               threadId,
@@ -2184,6 +2434,8 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
                 analysis,
               },
             );
+            runOutcome.status = "failed";
+            runOutcome.shouldRequeue = false;
             break;
           }
         } else {
@@ -2191,10 +2443,15 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
           lastError = "";
           store.updateMeta(threadId, {
             lastRunError: "",
+            recoveryAttempts: 0,
           });
         }
 
         priorAnalysis = analysis;
+      }
+      if (runOutcome.status === "continue" && endCycle >= stepLimit) {
+        runOutcome.status = "step_limit_reached";
+        runOutcome.shouldRequeue = false;
       }
     } catch (error) {
       if (isGemini503Error(error)) {
@@ -2238,7 +2495,43 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
 
         if (pauseCount > MAX_GEMINI_503_RUN_PAUSES) {
           gemini503ResumeDelayMs = 0;
+          runOutcome.status = "failed";
+          runOutcome.shouldRequeue = false;
         }
+      } else if (isGemini429Error(error)) {
+        const latestThread = store.getThread(threadId);
+        const pauseCount = Number(latestThread?.meta?.gemini429RunPauseCount || 0) + 1;
+        gemini429ResumeDelayMs = gemini429RunBackoffMs(pauseCount);
+        const resumeAt = new Date(Date.now() + gemini429ResumeDelayMs).toISOString();
+        const task = String(error?.task || error?.cause?.task || "LLM request").trim();
+        const pauseMessage = buildGemini429PauseMessage(task, resumeAt);
+
+        store.updateMeta(threadId, {
+          gemini429RunPauseCount: pauseCount,
+          gemini429ResumeAt: resumeAt,
+          lastRunError: pauseMessage,
+        });
+
+        runLogger.warn("agent.service", "gemini_429_run_paused", {
+          threadId,
+          task,
+          pauseCount,
+          resumeInMs: gemini429ResumeDelayMs,
+          resumeAt,
+        });
+
+        addAssistantMessage(
+          threadId,
+          "block",
+          pauseMessage,
+          {
+            phase: "gemini_429_backoff",
+            status: "paused",
+            task,
+            pauseCount,
+            resumeAt,
+          },
+        );
       } else {
         runLogger.error("agent.service", "run_failed", error, {
           threadId,
@@ -2252,21 +2545,44 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
             error instanceof Error ? error.message : String(error),
           ),
         );
+        runOutcome.status = "failed";
+        runOutcome.shouldRequeue = false;
       }
     } finally {
       runtime.stopRequested = false;
       runtime.running = false;
       const shouldResumeAfter503 = gemini503ResumeDelayMs > 0;
-      store.setStatus(threadId, shouldResumeAfter503 ? "submitted" : "idle");
+      const shouldResumeAfter429 = gemini429ResumeDelayMs > 0;
+      const shouldResume = shouldResumeAfter503 || shouldResumeAfter429;
+      if (shouldResumeAfter503) {
+        runOutcome.status = "paused_503";
+        runOutcome.shouldRequeue = queueManaged;
+        runOutcome.waitMs = gemini503ResumeDelayMs;
+      } else if (shouldResumeAfter429) {
+        runOutcome.status = "paused_429";
+        runOutcome.shouldRequeue = queueManaged;
+        runOutcome.waitMs = gemini429ResumeDelayMs;
+      }
+      store.setStatus(threadId, shouldResume ? "submitted" : "idle");
       if (!shouldResumeAfter503) {
         store.updateMeta(threadId, {
           gemini503ResumeAt: "",
           gemini503RunPauseCount: 0,
         });
       }
+      if (!shouldResumeAfter429) {
+        store.updateMeta(threadId, {
+          gemini429ResumeAt: "",
+          gemini429RunPauseCount: 0,
+        });
+      }
       runLogger.event("agent.service", "run_finished", {
-        status: shouldResumeAfter503 ? "submitted" : "idle",
+        status: shouldResume ? "submitted" : "idle",
         pendingCount: runtime.pendingGoals.length,
+        queueManaged,
+        outcome: runOutcome.status,
+        queueRunId,
+        turnIndex,
       });
 
       if (shouldResumeAfter503) {
@@ -2274,30 +2590,40 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
           threadId,
           resumeInMs: gemini503ResumeDelayMs,
         });
+        if (!queueManaged) {
+          setTimeout(() => {
+            runLoop(threadId, userGoal).catch((resumeError) => {
+              runLogger.error("agent.service", "gemini_503_resume_failed", resumeError, {
+                threadId,
+              });
+            });
+          }, gemini503ResumeDelayMs);
+        }
+      }
+
+      if (shouldResumeAfter429 && !queueManaged) {
         setTimeout(() => {
           runLoop(threadId, userGoal).catch((resumeError) => {
-            runLogger.error("agent.service", "gemini_503_resume_failed", resumeError, {
+            runLogger.error("agent.service", "gemini_429_resume_failed", resumeError, {
               threadId,
             });
           });
-        }, gemini503ResumeDelayMs);
+        }, gemini429ResumeDelayMs);
       }
 
-      if (!shouldResumeAfter503 && runtime.pendingGoals.length) {
+      if (!shouldResume && runtime.pendingGoals.length) {
         const nextGoal = runtime.pendingGoals.shift();
         runLogger.event("agent.service", "dequeue_goal_after_run", {
           threadId,
           pendingCount: runtime.pendingGoals.length,
         });
         if (nextGoal) {
-          runLoop(threadId, nextGoal).catch((error) => {
-            runLogger.error("agent.service", "queued_prompt_failed", error, {
-              threadId,
-            });
-          });
+          enqueueAgentTurn(threadId, nextGoal);
         }
       }
     }
+
+    return runOutcome;
   }
 
   async function submitPrompt(threadId, prompt, options = {}) {
@@ -2308,11 +2634,7 @@ function createAgentService({ env, logger, store, loadSettings, shortcutMemory, 
       meta: options.userMeta || {},
     });
 
-    runLoop(threadId, prompt).catch((error) => {
-      logger.error("agent.service", "submit_prompt_failed", error, {
-        threadId,
-      });
-    });
+    enqueueAgentTurn(threadId, prompt);
   }
 
   return {

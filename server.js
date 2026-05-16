@@ -691,9 +691,13 @@ async function runScheduledTicket(ticket, runKey) {
       source: "scheduler",
       runKey,
       threadId,
-      promise: Promise.resolve({
-        ticket: null,
-        thread: result.thread,
+      promise: Promise.resolve().then(() => {
+        const latestTickets = loadTickets();
+        const latestTicket = latestTickets.find((item) => item.id === ticket.id) || null;
+        return {
+          ticket: latestTicket,
+          thread: result.thread,
+        };
       }),
     });
 
